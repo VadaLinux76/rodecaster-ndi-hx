@@ -3,6 +3,8 @@
 [![License: MIT](https://img.shields.io/github/license/VadaLinux76/rodecaster-ndi-hx)](LICENSE)
 [![CI](https://github.com/VadaLinux76/rodecaster-ndi-hx/actions/workflows/ci.yml/badge.svg)](https://github.com/VadaLinux76/rodecaster-ndi-hx/actions/workflows/ci.yml)
 
+🇮🇹 Idea e progetto italiani, nati dal debugging di una serata su un RØDECaster Video vero.
+
 Trasforma una webcam USB collegata a un Raspberry Pi 4 in una sorgente **NDI|HX** vera (non
 NDI standard/SpeedHQ), usando l'encoder H.264 hardware del Pi4. Nato per alimentare un
 [RØDECaster Video](https://rode.com/en-us/rodecaster/rodecaster-video), che accetta solo
