@@ -46,7 +46,7 @@ public:
 
 private:
     std::vector<uint8_t> buf_;
-    static size_t find_start_code(const std::vector<uint8_t>& b, size_t from, int* len);
+    static size_t find_start_code(const std::vector<uint8_t>& b, size_t from, size_t* len);
 };
 
 // Annex-B: start code a 4 byte + NAL "nudo".

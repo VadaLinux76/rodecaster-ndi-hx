@@ -502,7 +502,7 @@ public:
 
 private:
     std::vector<uint8_t> buf_;
-    static size_t find_start_code(const std::vector<uint8_t>& b, size_t from, int* len);
+    static size_t find_start_code(const std::vector<uint8_t>& b, size_t from, size_t* len);
 };
 
 // Annex-B: start code a 4 byte + NAL "nudo".
@@ -554,7 +554,7 @@ private:
 
 namespace annexb {
 
-size_t NalReader::find_start_code(const std::vector<uint8_t>& b, size_t from, int* len) {
+size_t NalReader::find_start_code(const std::vector<uint8_t>& b, size_t from, size_t* len) {
     if (b.size() < 3) return npos;
     for (size_t i = from; i + 3 <= b.size(); i++) {
         if (b[i] == 0 && b[i + 1] == 0 && b[i + 2] == 1) {
@@ -566,24 +566,30 @@ size_t NalReader::find_start_code(const std::vector<uint8_t>& b, size_t from, in
     return npos;
 }
 
+// buf_.begin()+N vuole un difference_type (signed): questo helper accentra il cast da size_t,
+// che altrimenti Clang segnala come sign-conversion su ogni singolo punto d'uso.
+static std::vector<uint8_t>::const_iterator advance(std::vector<uint8_t>::const_iterator it, size_t n) {
+    return it + static_cast<std::vector<uint8_t>::difference_type>(n);
+}
+
 bool NalReader::next_nal(std::vector<uint8_t>* out) {
-    int len1 = 0;
+    size_t len1 = 0;
     size_t sc1 = find_start_code(buf_, 0, &len1);
     if (sc1 == npos) return false;
-    int len2 = 0;
+    size_t len2 = 0;
     size_t sc2 = find_start_code(buf_, sc1 + len1, &len2);
     if (sc2 == npos) return false; // NAL non ancora completo: aspetta altri dati
 
-    out->assign(buf_.begin() + sc1 + len1, buf_.begin() + sc2);
-    buf_.erase(buf_.begin(), buf_.begin() + sc2); // lascia lo start code successivo in testa
+    out->assign(advance(buf_.cbegin(), sc1 + len1), advance(buf_.cbegin(), sc2));
+    buf_.erase(buf_.begin(), advance(buf_.cbegin(), sc2)); // lascia lo start code successivo in testa
     return true;
 }
 
 bool NalReader::flush(std::vector<uint8_t>* out) {
-    int len1 = 0;
+    size_t len1 = 0;
     size_t sc1 = find_start_code(buf_, 0, &len1);
     if (sc1 == npos) return false;
-    out->assign(buf_.begin() + sc1 + len1, buf_.end());
+    out->assign(advance(buf_.cbegin(), sc1 + len1), buf_.cend());
     buf_.clear();
     return !out->empty();
 }
