@@ -8,7 +8,7 @@
 # Uso: ./doctor.sh [device webcam, es. /dev/video0]
 
 set -uo pipefail # niente -e: si vuole continuare anche se un singolo controllo fallisce
-cd "$(dirname "$0")"
+cd "$(dirname "$0")" || exit 1
 
 PASS=0
 FAIL=0
