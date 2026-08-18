@@ -135,3 +135,10 @@ sopravvissuti a lungo ai test locali.
 Questo codice è rilasciato sotto licenza MIT (vedi `LICENSE`). L'NDI Advanced SDK necessario
 per compilarlo **non è incluso** ed è soggetto alla licenza propria di Vizrt/NDI
 (vedi [ndi.video](https://ndi.video/for-developers/ndi-advanced/)).
+
+## Per assistenti/agenti AI
+
+[`llms-full.txt`](llms-full.txt) contiene il contenuto integrale di questo repository
+(README, sorgenti, script, config) consolidato in un unico file di testo, secondo la
+convenzione [llms-full.txt](https://llmstxt.org/) — comodo da dare in pasto a un LLM senza
+dover seguire link o clonare la repo.

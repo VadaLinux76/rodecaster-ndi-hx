@@ -1,0 +1,759 @@
+# rodecaster-ndi-hx — llms-full.txt
+
+> Contenuto completo del repository, consolidato in un unico file per una lettura
+> facilitata da parte di assistenti/agenti AI. Segue la convenzione llms-full.txt
+> (https://llmstxt.org/) — variante "full" di llms.txt: invece di soli link, include
+> il contenuto integrale di ogni file rilevante del progetto.
+
+Progetto: sender NDI|HX per Raspberry Pi 4 — trasforma una webcam USB in una sorgente
+NDI|HX vera (H.264 via encoder hardware bcm2835-codec), bypassando le API standard di
+NDI Send per scrivere pacchetti compressi direttamente con l'NDI Advanced SDK. Nato per
+interoperare con un RØDECaster Video. Licenza: MIT. Repository:
+https://github.com/VadaLinux76/rodecaster-ndi-hx
+
+---
+
+## File: `README.md`
+
+# rodecaster-ndi-hx
+
+[![License: MIT](https://img.shields.io/github/license/VadaLinux76/rodecaster-ndi-hx)](LICENSE)
+[![CI](https://github.com/VadaLinux76/rodecaster-ndi-hx/actions/workflows/ci.yml/badge.svg)](https://github.com/VadaLinux76/rodecaster-ndi-hx/actions/workflows/ci.yml)
+
+🇮🇹 Idea e progetto italiani, nati dal debugging di una serata su un RØDECaster Video vero.
+
+Trasforma una webcam USB collegata a un Raspberry Pi 4 in una sorgente **NDI|HX** vera (non
+NDI standard/SpeedHQ), usando l'encoder H.264 hardware del Pi4. Nato per alimentare un
+[RØDECaster Video](https://rode.com/en-us/rodecaster/rodecaster-video), che accetta solo
+NDI|HX2+ certificato — ma qualunque receiver NDI|HX dovrebbe andare bene.
+
+```
+webcam USB (MJPEG/YUYV) --ffmpeg--> H.264 (encoder hardware bcm2835-codec) --ndi_hx_send--> NDI|HX
+```
+
+## Perché non uno dei tanti "webcam to NDI" già in giro
+
+I tool "NDI to webcam" comuni mandano NDI *standard* (compresso internamente in SpeedHQ dalla
+libreria), che è molto più pesante in banda e **non è quello che un device NDI|HX-only si
+aspetta**. Per fare vero NDI|HX serve mandare pacchetti H.264/HEVC già compressi usando le API
+di basso livello dell'**NDI Advanced SDK** — capacità non documentata benissimo, e con un paio
+di trabocchetti non ovvi (vedi sotto). Questo repo è il risultato di quella sessione di
+debugging, in modo che chi ci si scontra dopo non debba rifarla da zero.
+
+## Requisiti
+
+- Raspberry Pi 4 (serve l'encoder H.264 hardware `bcm2835-codec`, esposto da ffmpeg come
+  `h264_v4l2m2m`) — su altro hardware serve adattare `capture_cam_hx.sh`
+- Una webcam USB che parli MJPEG o YUYV via V4L2 (`v4l2-ctl --list-formats-ext`)
+- `ffmpeg` con supporto `h264_v4l2m2m` (di serie su Raspberry Pi OS / Ubuntu per Pi recenti)
+- **NDI Advanced SDK** — *non incluso in questo repo* (proprietario Vizrt/NDI, licenza
+  d'uso gratuita ma non ridistribuibile). Scaricalo da
+  [ndi.video](https://ndi.video/for-developers/ndi-advanced/) (richiede una registrazione
+  gratuita), estrallo, e passa il path a `build_hx.sh`/`build_inspect.sh` via `NDI_SDK_DIR` se
+  non lo metti in `./ndi-adv-sdk` accanto agli script.
+
+  Nota: la versione liberamente scaricabile dell'SDK è marcata "development use" e si
+  autolimita a stream di 30 minuti — per uso continuativo/commerciale serve contattare
+  `licensing@ndi.video`. Nei test descritti sotto non abbiamo mai raggiunto quel limite.
+
+## Build
+
+```bash
+./build_hx.sh        # -> ndi_hx_send (il sender)
+./build_inspect.sh    # -> ndi_hx_inspect (tool diagnostico, opzionale)
+```
+
+## Uso
+
+```bash
+./capture_cam_hx.sh <device> <larghezza> <altezza> <fps> <nome_ndi> [bitrate] [gop_frame] [profilo] [livello]
+
+# esempio:
+./capture_cam_hx.sh /dev/video0 1920 1080 30 "Pi4 Cam HX" 8M 2
+```
+
+Per farlo partire al boot, copia `ndi-webcam-send.service` in `/etc/systemd/system/`
+(sostituendo i placeholder `<user>` e il path della tua webcam), poi:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now ndi-webcam-send.service
+```
+
+## `ndi_hx_inspect`: verificare cosa arriva davvero
+
+```bash
+./ndi_hx_inspect "<nome sorgente NDI>"
+```
+
+Si collega come receiver NDI in modalità `COMPRESSED` e stampa la struttura reale dei pacchetti
+ricevuti (FourCC, keyframe, dimensioni, extra_data). Utile sia per debuggare il proprio sender
+sia per ispezionare come si comporta una sorgente HX certificata reale (es. l'app RODE Capture
+su smartphone) e confrontarla.
+
+## I 6 bug non ovvi (la parte utile per chi arriva da una ricerca disperata)
+
+Il sintomo di partenza, su un receiver certificato reale (RØDECaster Video): connessione NDI
+stabilita normalmente, tally funzionante, ma video rifiutato con
+`unsupported, resolution 0x0, frame rate 23, format N/A`. Un tool di verifica scritto in casa
+(che si limita a leggere i byte senza decodificarli davvero) può sembrare che tutto funzioni
+anche quando il contenuto è semanticamente sbagliato — motivo per cui questi bug sono
+sopravvissuti a lungo ai test locali.
+
+1. **FourCC `*_lowest_bandwidth` non è "lo stesso video a bitrate più basso"**: per specifica
+   NDI è riservato a un secondo stream di *anteprima a risoluzione fissa 640px*. Per il flusso
+   principale a piena risoluzione va sempre usato `*_highest_bandwidth`, qualunque sia la
+   risoluzione reale che stai inviando. (Inizialmente sembrava un problema di licenza dell'SDK,
+   dato che i frame taggati `lowest_bandwidth` non arrivavano mai a nessun receiver — la causa
+   vera è proprio che l'SDK li scarta se non rispettano il vincolo dei 640px.)
+
+2. **La causa reale del "resolution 0x0 / format N/A"**: i dati video e l'extra_data (SPS/PPS)
+   vanno in formato **Annex-B** (start code `00 00 00 01`), *non* AVCC/length-prefixed (lo
+   stile MP4/avcC). La [documentazione ufficiale](https://docs.ndi.video/all/developing-with-ndi/advanced-sdk/using-h.264-h.265-and-aac-codecs/sending-video-frames)
+   lo dice esplicitamente, ma è facile non trovarla e assumere AVCC per abitudine.
+
+3. `NDIlib_video_frame_v2_t.picture_aspect_ratio` **non può essere 0** per stream compressi —
+   va messo il rapporto reale (es. `(float)width / height`). Con 0 un receiver strict può
+   leggere dimensioni non valide.
+
+4. `frame.timecode` deve essere il **PTS reale** del pacchetto, non il sentinel
+   `NDIlib_send_timecode_synthesize`.
+
+5. L'encoder hardware del Pi4 usa di default **H.264 High Profile**. Impostarlo su un profilo
+   più compatibile (es. Main) con `v4l2-ctl --set-ctrl` *prima* di avviare ffmpeg **non ha
+   alcun effetto**: i device V4L2 mem2mem sono stateless, ogni `open()` (compreso quello di
+   ffmpeg) crea un'istanza indipendente con i default hardware. Il profilo va passato a ffmpeg
+   stesso, come **valore numerico** (`-profile:v 77` per Main, `100` per High — i nomi stringa
+   tipo `"main"` non sono accettati da `h264_v4l2m2m`).
+
+6. `h264_v4l2m2m` ignora `-g` da solo: servono keyframe forzati esplicitamente con
+   `-force_key_frames "expr:eq(mod(n,GOP),0)"`. Nella config qui il GOP è tenuto molto corto
+   (un keyframe ogni 2 frame, ~66ms) perché l'SDK NDI segnala a runtime che per essere
+   "NDI|HX compliant" un I-frame deve arrivare entro 100ms da quando un receiver si connette.
+
+## Limitazioni
+
+- **Il Pi4 viaggia stabilmente intorno al 95% di CPU** (misurato a 1920x1080@30) mentre lo
+  stream è attivo. Il colpevole non è l'encoder H.264 (quello è hardware): è il decode
+  software del MJPEG in ingresso dalla webcam più la conversione di colorspace fatte da
+  ffmpeg su CPU, che da sole occupano stabilmente 2+ core su 4. Su un Pi4 dedicato solo a
+  questo va bene, ma non aspettarti margine per fare altro sulla stessa macchina.
+- Il Pi4 non ha encoder HEVC hardware (solo decode) — quindi qui si fa NDI|HX2 (H.264), non
+  HX3/HEVC. HX3 via software encoding sarebbe probabilmente troppo pesante per il Pi4 in
+  tempo reale (si aggiungerebbe all'uso di CPU già alto del punto sopra).
+- Testato con una singola webcam USB MJPEG 1920x1080@30 e un RØDECaster Video. Altre
+  combinazioni webcam/receiver potrebbero avere ulteriori sorprese — issue e PR benvenute.
+- La CI (badge sopra) valida solo gli script bash (`shellcheck`): l'SDK NDI Advanced non è
+  scaricabile automaticamente in CI (richiede registrazione manuale su ndi.video), quindi il
+  codice C++ non viene compilato automaticamente ad ogni push.
+
+## Licenza
+
+Questo codice è rilasciato sotto licenza MIT (vedi `LICENSE`). L'NDI Advanced SDK necessario
+per compilarlo **non è incluso** ed è soggetto alla licenza propria di Vizrt/NDI
+(vedi [ndi.video](https://ndi.video/for-developers/ndi-advanced/)).
+
+## Per assistenti/agenti AI
+
+[`llms-full.txt`](llms-full.txt) contiene il contenuto integrale di questo repository
+(README, sorgenti, script, config) consolidato in un unico file di testo, secondo la
+convenzione [llms-full.txt](https://llmstxt.org/) — comodo da dare in pasto a un LLM senza
+dover seguire link o clonare la repo.
+
+---
+
+## File: `LICENSE`
+
+```
+MIT License
+
+Copyright (c) 2026 crigamo3srls
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+---
+
+## File: `.gitignore`
+
+```
+# SDK NDI proprietario: non va committato, si scarica da ndi.video (vedi README)
+ndi-adv-sdk/
+ndi-sdk/
+
+# Binari compilati
+ndi_hx_send
+ndi_hx_inspect
+
+# Editor/OS
+*.o
+*.swp
+.DS_Store
+```
+
+---
+
+## File: `ndi-webcam-send.service`
+
+```ini
+[Unit]
+Description=Cattura webcam USB e invio come sorgente NDI|HX (H.264 hardware)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Sostituisci <user> con il tuo utente
+User=<user>
+WorkingDirectory=/home/<user>/rodecaster-ndi-hx
+# Sostituisci il device con `v4l2-ctl --list-devices` o `ls /dev/v4l/by-id/` sulla tua webcam,
+# e adatta risoluzione/fps/nome sorgente NDI/bitrate/gop ai tuoi bisogni.
+ExecStart=/home/<user>/rodecaster-ndi-hx/capture_cam_hx.sh /dev/v4l/by-id/usb-<la-tua-webcam>-video-index0 1920 1080 30 "Pi4 Cam HX" 8M 2
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+```
+
+---
+
+## File: `capture_cam_hx.sh`
+
+```bash
+#!/bin/bash
+# Cattura una webcam V4L2 (MJPEG), la codifica in H.264 con l'encoder hardware del Pi4
+# (bcm2835-codec / h264_v4l2m2m) e la pubblica come sorgente NDI HX (compressa).
+#
+# I keyframe sono forzati molto ravvicinati (default: ogni 2 frame) invece che ogni paio
+# di secondi. Motivo: l'NDI Advanced SDK segnala a runtime che per essere "NDI|HX compliant"
+# un I-frame deve arrivare entro 100ms da quando un receiver si connette/lo richiede. ffmpeg
+# non permette di pilotare l'encoder in modo reattivo su richiesta, quindi l'unica strada e'
+# tenere il gruppo di immagini cosi' corto che ce n'e' sempre uno "fresco" (< 100ms) pronto.
+# Costo: bitrate piu' alto a parita' di qualita' (gli I-frame pesano piu' dei P-frame).
+#
+# Uso: ./capture_cam_hx.sh <device> <larghezza> <altezza> <fps> <nome_ndi> [bitrate] [gop_frame]
+# Esempio:
+#   ./capture_cam_hx.sh /dev/video0 1920 1080 30 "Pi4 Cam HX" 8M 2
+
+set -euo pipefail
+cd "$(dirname "$0")"
+
+DEVICE="${1:?device, es. /dev/video0}"
+WIDTH="${2:?larghezza, es. 1920}"
+HEIGHT="${3:?altezza, es. 1080}"
+FPS="${4:?fps, es. 30}"
+NDI_NAME="${5:?nome sorgente NDI, es. \"Pi4 Cam HX\"}"
+BITRATE="${6:-8M}"
+GOP="${7:-2}"
+H264_PROFILE="${8:-77}" # AVCodecContext.profile: 66=Baseline 77=Main 100=High (default HW: 100/High)
+H264_LEVEL="${9:-31}"   # AVCodecContext.level *10: 31=Level 3.1, 40=Level 4.0
+
+# L'encoder hardware bcm2835-codec di default usa H.264 High Profile / Level 4, che receiver
+# NDI|HX certificati (es. RODECaster) rifiutano ("unsupported resolution 0x0" e' il sintomo:
+# non riescono a validare/decodificare lo stream). Nota: /dev/videoN per un codec V4L2 mem2mem
+# e' stateless, ogni open() crea un'istanza indipendente con i default hardware, quindi
+# impostare il profilo con v4l2-ctl PRIMA non ha alcun effetto sull'istanza aperta da ffmpeg:
+# va passato a ffmpeg stesso (che lo applica alla propria istanza) come valore numerico
+# (i nomi tipo "main" non sono accettati da questo encoder).
+
+exec ffmpeg -hide_banner -loglevel warning \
+    -f v4l2 -input_format mjpeg -video_size "${WIDTH}x${HEIGHT}" -framerate "$FPS" \
+    -i "$DEVICE" \
+    -pix_fmt nv12 -c:v h264_v4l2m2m -b:v "$BITRATE" -g "$GOP" -bf 0 \
+    -profile:v "$H264_PROFILE" -level:v "$H264_LEVEL" \
+    -num_capture_buffers 16 \
+    -force_key_frames "expr:eq(mod(n,${GOP}),0)" \
+    -f h264 - \
+| ./ndi_hx_send "$NDI_NAME" "$WIDTH" "$HEIGHT" "$FPS" 1 highest
+```
+
+---
+
+## File: `build_hx.sh`
+
+```bash
+#!/bin/bash
+# Compila ndi_hx_send collegandolo all'NDI Advanced SDK.
+#
+# L'SDK NON e' incluso in questo repo (e' proprietario di Vizrt/NDI, licenza gratuita ma non
+# ridistribuibile) - vedi il README per come scaricarlo. Estrallo in una cartella e passane il
+# path in NDI_SDK_DIR se non e' ./ndi-adv-sdk accanto a questo script, es.:
+#   NDI_SDK_DIR=/opt/ndi-advanced-sdk ./build_hx.sh
+
+set -euo pipefail
+cd "$(dirname "$0")"
+
+NDI_SDK="${NDI_SDK_DIR:-./ndi-adv-sdk}"
+
+if [ ! -d "$NDI_SDK/include" ]; then
+    echo "SDK NDI Advanced non trovato in $NDI_SDK (vedi README per scaricarlo)." >&2
+    echo "Imposta NDI_SDK_DIR se l'hai messo altrove." >&2
+    exit 1
+fi
+
+# La cartella lib contiene una sottocartella per architettura (es. x86_64-linux-gnu,
+# aarch64-rpi4-linux-gnueabi su Raspberry Pi OS/Ubuntu). La prendiamo automaticamente.
+LIBDIR=$(find "$NDI_SDK/lib" -mindepth 1 -maxdepth 1 -type d | head -1)
+if [ -z "$LIBDIR" ]; then
+    echo "Nessuna sottocartella lib/<arch> trovata sotto $NDI_SDK/lib" >&2
+    exit 1
+fi
+
+g++ -std=c++17 -O2 -Wall \
+    -I"$NDI_SDK/include" \
+    -L"$LIBDIR" \
+    -Wl,-rpath,"$(realpath "$LIBDIR")" \
+    -o ndi_hx_send ndi_hx_send.cpp \
+    -lndi_advanced -ldl -lpthread
+
+echo "Build OK -> ./ndi_hx_send (linkato contro $LIBDIR)"
+```
+
+---
+
+## File: `build_inspect.sh`
+
+```bash
+#!/bin/bash
+# Compila ndi_hx_inspect, il tool diagnostico che si collega a una sorgente NDI in modalita'
+# COMPRESSED e stampa la struttura dei pacchetti ricevuti (utile per confrontare il proprio
+# sender con una sorgente HX reale, es. RODE Capture su smartphone). Stesso SDK di build_hx.sh.
+
+set -euo pipefail
+cd "$(dirname "$0")"
+
+NDI_SDK="${NDI_SDK_DIR:-./ndi-adv-sdk}"
+
+if [ ! -d "$NDI_SDK/include" ]; then
+    echo "SDK NDI Advanced non trovato in $NDI_SDK (vedi README per scaricarlo)." >&2
+    exit 1
+fi
+
+LIBDIR=$(find "$NDI_SDK/lib" -mindepth 1 -maxdepth 1 -type d | head -1)
+if [ -z "$LIBDIR" ]; then
+    echo "Nessuna sottocartella lib/<arch> trovata sotto $NDI_SDK/lib" >&2
+    exit 1
+fi
+
+g++ -std=c++17 -O2 -Wall \
+    -I"$NDI_SDK/include" \
+    -L"$LIBDIR" \
+    -Wl,-rpath,"$(realpath "$LIBDIR")" \
+    -o ndi_hx_inspect ndi_hx_inspect.cpp \
+    -lndi_advanced -ldl -lpthread
+
+echo "Build OK -> ./ndi_hx_inspect (linkato contro $LIBDIR)"
+```
+
+---
+
+## File: `ndi_hx_send.cpp`
+
+```cpp
+// Legge uno stream elementare H.264 Annex-B (NAL con start code 00 00 01 / 00 00 00 01) da
+// stdin e lo ripubblica, sempre in Annex-B, dentro un pacchetto NDI in modalita' COMPRESSA
+// (NDIlib_FourCC_video_type_ex_H264_*), cioe' lo stesso meccanismo di trasporto usato da
+// NDI|HX. Richiede l'NDI Advanced SDK (necessario per i FourCC compressi e per la scrittura
+// diretta di pacchetti gia' codificati).
+//
+// Formato dati: la documentazione ufficiale NDI e' esplicita — "NDI assumes that all H.264
+// data is as specified in Annex B... and the data must include the start codes", sia per il
+// campo dati che per extra_data (SPS/PPS). NON va convertito in AVCC/length-prefixed.
+//
+// Pensato per essere alimentato da ffmpeg che cattura la webcam (MJPEG/YUYV via V4L2) e la
+// codifica in H.264 con l'encoder hardware del Pi4 (h264_v4l2m2m):
+//
+//   ffmpeg -f v4l2 -input_format mjpeg -video_size 1280x720 -framerate 30 -i /dev/video0
+//       -pix_fmt nv12 -c:v h264_v4l2m2m -b:v 4M -g 60 -bf 0 -f h264 -
+//   | ./ndi_hx_send "Pi4 Cam HX" 1280 720 30
+//
+// Uso: ndi_hx_send <nome_ndi> <larghezza> <altezza> <fps_num> [fps_den] [bandwidth]
+//   bandwidth: "highest" (default) oppure "lowest".
+//   Nota: "lowest_bandwidth" e' riservato, per specifica NDI, a un secondo stream di
+//   anteprima a risoluzione FISSA 640px di larghezza — non e' "lo stesso video a bitrate
+//   piu' basso". Per il flusso principale a risoluzione piena va sempre usato
+//   "highest_bandwidth", qualunque sia la risoluzione reale inviata.
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <csignal>
+#include <cerrno>
+#include <vector>
+#include <unistd.h>
+#include <Processing.NDI.Advanced.h>
+
+static volatile sig_atomic_t g_stop = 0;
+static void on_signal(int) { g_stop = 1; }
+
+// --- Lettura incrementale da stdin con estrazione dei NAL Annex-B --------------------------
+
+struct NalReader {
+    std::vector<uint8_t> buf;
+    static const size_t CHUNK = 65536;
+
+    // Ritorna true se e' stato letto qualcosa (false = EOF).
+    bool fill() {
+        uint8_t tmp[CHUNK];
+        ssize_t n = read(STDIN_FILENO, tmp, sizeof(tmp));
+        if (n <= 0) {
+            if (n < 0 && errno == EINTR) return true; // riprova
+            return false;
+        }
+        buf.insert(buf.end(), tmp, tmp + n);
+        return true;
+    }
+
+    // Trova l'offset del prossimo start code (00 00 01 o 00 00 00 01) a partire da `from`.
+    // Ritorna la posizione di inizio del codice e la sua lunghezza (3 o 4), oppure npos.
+    static const size_t npos = (size_t)-1;
+
+    static size_t find_start_code(const std::vector<uint8_t>& b, size_t from, int* len) {
+        if (b.size() < 3) return npos;
+        for (size_t i = from; i + 3 <= b.size(); i++) {
+            if (b[i] == 0 && b[i + 1] == 0 && b[i + 2] == 1) {
+                if (i > from && b[i - 1] == 0) { *len = 4; return i - 1; }
+                *len = 3;
+                return i;
+            }
+        }
+        return npos;
+    }
+
+    // Estrae il prossimo NAL completo (payload, senza start code) se ne e' disponibile uno
+    // interamente delimitato da due start code consecutivi. Consuma il buffer via erase.
+    bool next_nal(std::vector<uint8_t>* out) {
+        int len1 = 0;
+        size_t sc1 = find_start_code(buf, 0, &len1);
+        if (sc1 == npos) return false;
+        int len2 = 0;
+        size_t sc2 = find_start_code(buf, sc1 + len1, &len2);
+        if (sc2 == npos) return false; // NAL non ancora completo: aspetta altri dati
+
+        out->assign(buf.begin() + sc1 + len1, buf.begin() + sc2);
+        buf.erase(buf.begin(), buf.begin() + sc2); // lascia lo start code successivo in testa
+        return true;
+    }
+};
+
+// Formato Annex-B: start code a 4 byte + NAL "nudo". Confermato dalla documentazione ufficiale
+// NDI: "NDI assumes that all H.264 data is as specified in Annex B... and the data must
+// include the start codes" - sia per i dati frame che per l'extra_data (SPS/PPS).
+static void append_annexb(std::vector<uint8_t>* out, const std::vector<uint8_t>& nal) {
+    static const uint8_t sc[4] = {0, 0, 0, 1};
+    out->insert(out->end(), sc, sc + 4);
+    out->insert(out->end(), nal.begin(), nal.end());
+}
+
+int main(int argc, char* argv[])
+{
+    if (argc < 4) {
+        fprintf(stderr,
+            "Uso: %s <nome_ndi> <larghezza> <altezza> <fps> [fps_den] [lowest|highest]\n",
+            argv[0]);
+        return 1;
+    }
+
+    const char* ndi_name = argv[1];
+    const int width  = atoi(argv[2]);
+    const int height = atoi(argv[3]);
+    const int fps_n  = atoi(argv[4]);
+    const int fps_d  = (argc > 5) ? atoi(argv[5]) : 1;
+    const bool lowest_bw = (argc > 6) ? (strcmp(argv[6], "lowest") == 0) : false;
+
+    if (width <= 0 || height <= 0 || fps_n <= 0) {
+        fprintf(stderr, "Parametri non validi.\n");
+        return 1;
+    }
+
+    signal(SIGINT, on_signal);
+    signal(SIGTERM, on_signal);
+    signal(SIGPIPE, SIG_IGN);
+
+    if (!NDIlib_initialize()) {
+        fprintf(stderr, "NDIlib_initialize() fallita (CPU non supportata?).\n");
+        return 1;
+    }
+
+    NDIlib_send_create_t create_desc;
+    create_desc.p_ndi_name = ndi_name;
+    create_desc.p_groups = NULL;
+    create_desc.clock_video = true;
+    create_desc.clock_audio = false;
+
+    NDIlib_send_instance_t pNDI_send = NDIlib_send_create(&create_desc);
+    if (!pNDI_send) {
+        fprintf(stderr, "NDIlib_send_create() fallita.\n");
+        NDIlib_destroy();
+        return 1;
+    }
+
+    const NDIlib_FourCC_video_type_e fourcc = (NDIlib_FourCC_video_type_e)(
+        lowest_bw ? NDIlib_FourCC_video_type_ex_H264_lowest_bandwidth
+                  : NDIlib_FourCC_video_type_ex_H264_highest_bandwidth);
+
+    fprintf(stderr, "NDI HX source '%s' avviata: %dx%d @ %d/%d fps (H264 %s bandwidth)\n",
+            ndi_name, width, height, fps_n, fps_d, lowest_bw ? "lowest" : "highest");
+
+    NalReader reader;
+    std::vector<uint8_t> nal;
+    std::vector<uint8_t> sps_nal, pps_nal;  // ultimi SPS/PPS "nudi" (senza start code)
+    std::vector<uint8_t> annexb_extradata;  // SPS+PPS in Annex-B (start code + NAL, concatenati)
+    std::vector<uint8_t> au;                // access unit corrente, formato Annex-B
+    uint64_t frame_index = 0;
+    uint64_t frames_sent = 0;
+    bool have_params = false;
+
+    auto emit_frame = [&](bool is_keyframe) {
+        if (au.empty()) return;
+
+        const size_t hdr_size = sizeof(NDIlib_compressed_packet_t);
+        const size_t extra_size = is_keyframe ? annexb_extradata.size() : 0;
+        const size_t total = hdr_size + au.size() + extra_size;
+
+        std::vector<uint8_t> packet(total);
+        NDIlib_compressed_packet_t* hdr = (NDIlib_compressed_packet_t*)packet.data();
+        hdr->version = NDIlib_compressed_packet_version_0;
+        hdr->fourCC = NDIlib_compressed_FourCC_type_H264;
+        int64_t hns = (int64_t)((double)frame_index * 10000000.0 * fps_d / fps_n);
+        hdr->pts = hns;
+        hdr->dts = hns;
+        hdr->reserved = 0;
+        hdr->flags = is_keyframe ? NDIlib_compressed_packet_flags_keyframe
+                                  : NDIlib_compressed_packet_flags_none;
+        hdr->data_size = (uint32_t)au.size();
+        hdr->extra_data_size = (uint32_t)extra_size;
+
+        memcpy(packet.data() + hdr_size, au.data(), au.size());
+        if (extra_size) memcpy(packet.data() + hdr_size + au.size(), annexb_extradata.data(), extra_size);
+
+        NDIlib_video_frame_v2_t frame;
+        frame.xres = width;
+        frame.yres = height;
+        frame.FourCC = fourcc;
+        frame.frame_rate_N = fps_n;
+        frame.frame_rate_D = fps_d;
+        frame.picture_aspect_ratio = (float)width / (float)height; // 0 non va bene per stream compressi
+        frame.frame_format_type = NDIlib_frame_format_type_progressive;
+        frame.timecode = hns; // deve essere il PTS reale, non il sentinel "synthesize"
+        frame.p_data = packet.data();
+        frame.data_size_in_bytes = (int)total;
+        frame.p_metadata = NULL;
+        frame.timestamp = 0;
+
+        if (is_keyframe && frames_sent == 0) {
+            // Debug una tantum: SPS/PPS "nudi" e il pacchetto NDI esatto del primo keyframe,
+            // per poterli ispezionare con ffprobe/hexdump fuori banda.
+            FILE* f1 = fopen("/tmp/hx_debug_sps_annexb.h264", "wb");
+            if (f1) {
+                static const uint8_t sc[4] = {0, 0, 0, 1};
+                fwrite(sc, 1, 4, f1); fwrite(sps_nal.data(), 1, sps_nal.size(), f1);
+                fwrite(sc, 1, 4, f1); fwrite(pps_nal.data(), 1, pps_nal.size(), f1);
+                fclose(f1);
+            }
+            FILE* f2 = fopen("/tmp/hx_debug_extradata.bin", "wb");
+            if (f2) { fwrite(annexb_extradata.data(), 1, annexb_extradata.size(), f2); fclose(f2); }
+            FILE* f3 = fopen("/tmp/hx_debug_ndi_packet.bin", "wb");
+            if (f3) { fwrite(packet.data(), 1, packet.size(), f3); fclose(f3); }
+            fprintf(stderr, "[ndi_hx_send][debug] sps=%zuB pps=%zuB extradata=%zuB au=%zuB packet_tot=%zuB "
+                             "-> /tmp/hx_debug_*.bin\n",
+                    sps_nal.size(), pps_nal.size(), annexb_extradata.size(), au.size(), packet.size());
+        }
+
+        NDIlib_send_send_video_scatter(pNDI_send, &frame, NULL);
+        frames_sent++;
+        frame_index++;
+        if (frames_sent % (uint64_t)(fps_n * 10 / fps_d) == 0) { // ~ogni 10s
+            fprintf(stderr, "[ndi_hx_send] %llu frame inviati, connessioni attive=%d\n",
+                    (unsigned long long)frames_sent, NDIlib_send_get_no_connections(pNDI_send, 0));
+        }
+        au.clear();
+    };
+
+    while (!g_stop) {
+        while (reader.next_nal(&nal)) {
+            if (nal.empty()) continue;
+            const int nal_type = nal[0] & 0x1f;
+
+            if (nal_type == 7 || nal_type == 8) {
+                // SPS (7) / PPS (8): tenute "nude" (senza start code) e riassemblate in Annex-B.
+                if (nal_type == 7) sps_nal = nal;
+                if (nal_type == 8) pps_nal = nal;
+                if (!sps_nal.empty() && !pps_nal.empty()) {
+                    annexb_extradata.clear();
+                    append_annexb(&annexb_extradata, sps_nal);
+                    append_annexb(&annexb_extradata, pps_nal);
+                    have_params = true;
+                }
+                continue;
+            }
+            if (nal_type == 9 || nal_type == 6) {
+                continue; // AUD / SEI: non servono nel payload NDI
+            }
+            if (nal_type == 1 || nal_type == 5) {
+                // Slice (non-IDR / IDR): un frame per slice, dato che l'encoder non fa slicing.
+                append_annexb(&au, nal);
+                emit_frame(/*is_keyframe=*/nal_type == 5 && have_params);
+                continue;
+            }
+            // Altri tipi (filler, ecc.): ignorati.
+        }
+        if (!reader.fill()) break; // EOF su stdin (ffmpeg terminato)
+    }
+
+    fprintf(stderr, "Stream terminato. Inviati %llu frame.\n", (unsigned long long)frames_sent);
+
+    NDIlib_send_destroy(pNDI_send);
+    NDIlib_destroy();
+    return 0;
+}
+```
+
+---
+
+## File: `ndi_hx_inspect.cpp`
+
+```cpp
+// Si collega a una sorgente NDI (per nome) in modalita' COMPRESSA (nessun decode)
+// e stampa la struttura reale dei pacchetti H264/HEVC/SpeedHQ ricevuti: utile per
+// confrontare un vero sender HX (es. RODE Capture su iPhone) con il nostro.
+#include <cstdio>
+#include <cstring>
+#include <chrono>
+#include <Processing.NDI.Advanced.h>
+
+static void hexdump(const uint8_t* p, int n, const char* label)
+{
+    fprintf(stderr, "  %s (%d byte): ", label, n);
+    int show = n < 256 ? n : 256;
+    for (int i = 0; i < show; i++) fprintf(stderr, "%02x ", p[i]);
+    if (n > show) fprintf(stderr, "...");
+    fprintf(stderr, "\n");
+}
+
+int main(int argc, char* argv[])
+{
+    const char* name_filter = (argc > 1) ? argv[1] : "";
+
+    if (!NDIlib_initialize()) return 1;
+    NDIlib_find_instance_t pFind = NDIlib_find_create_v2();
+    if (!pFind) return 1;
+
+    const NDIlib_source_t* p_sources = nullptr;
+    uint32_t no_sources = 0;
+    const NDIlib_source_t* chosen = nullptr;
+
+    for (int tries = 0; tries < 15 && !chosen; tries++) {
+        NDIlib_find_wait_for_sources(pFind, 1000);
+        p_sources = NDIlib_find_get_current_sources(pFind, &no_sources);
+        fprintf(stderr, "Sorgenti viste (%u):\n", no_sources);
+        for (uint32_t i = 0; i < no_sources; i++) {
+            fprintf(stderr, "  - %s\n", p_sources[i].p_ndi_name);
+            if (!chosen && strstr(p_sources[i].p_ndi_name, name_filter))
+                chosen = &p_sources[i];
+        }
+    }
+    if (!chosen) { fprintf(stderr, "Sorgente '%s' non trovata.\n", name_filter); return 1; }
+    fprintf(stderr, "Connessione (COMPRESSED) a: %s\n", chosen->p_ndi_name);
+
+    NDIlib_recv_create_v3_t recv_desc;
+    recv_desc.source_to_connect_to = *chosen;
+    recv_desc.color_format = (NDIlib_recv_color_format_e)NDIlib_recv_color_format_ex_compressed_v3;
+    recv_desc.bandwidth = NDIlib_recv_bandwidth_highest;
+    recv_desc.allow_video_fields = false;
+    recv_desc.p_ndi_recv_name = "HX Inspector";
+
+    NDIlib_recv_instance_t pRecv = NDIlib_recv_create_v3(&recv_desc);
+    if (!pRecv) { fprintf(stderr, "recv_create fallita\n"); return 1; }
+
+    using namespace std::chrono;
+    int shown = 0;
+    int polls = 0;
+    for (const auto start = high_resolution_clock::now(); high_resolution_clock::now() - start < seconds(12);) {
+        NDIlib_video_frame_v2_t vf;
+        NDIlib_audio_frame_v2_t af;
+        NDIlib_metadata_frame_t mf;
+        auto ft = NDIlib_recv_capture_v2(pRecv, &vf, &af, &mf, 1000);
+        polls++;
+        fprintf(stderr, "[poll %d] frame_type=%d\n", polls, (int)ft);
+        if (ft == NDIlib_frame_type_video) {
+            fprintf(stderr, "\n=== video frame: xres=%d yres=%d FourCC=0x%08x aspect=%.3f fmt_type=%d ===\n",
+                    vf.xres, vf.yres, (unsigned)vf.FourCC, vf.picture_aspect_ratio, (int)vf.frame_format_type);
+
+            bool is_compressed = (vf.FourCC == (NDIlib_FourCC_video_type_e)NDIlib_compressed_FourCC_type_H264)
+                               || (vf.FourCC == (NDIlib_FourCC_video_type_e)NDIlib_compressed_FourCC_type_HEVC)
+                               || ((unsigned)vf.FourCC == (unsigned)NDIlib_FourCC_video_type_ex_H264_lowest_bandwidth)
+                               || ((unsigned)vf.FourCC == (unsigned)NDIlib_FourCC_video_type_ex_HEVC_lowest_bandwidth);
+
+            if (is_compressed && vf.p_data) {
+                const NDIlib_compressed_packet_t* hdr = (const NDIlib_compressed_packet_t*)vf.p_data;
+                fprintf(stderr, "  packet.version=%d (sizeof=%zu) fourCC=0x%08x flags=%u data_size=%u extra_data_size=%u pts=%lld dts=%lld\n",
+                        hdr->version, sizeof(NDIlib_compressed_packet_t), (unsigned)hdr->fourCC, hdr->flags,
+                        hdr->data_size, hdr->extra_data_size, (long long)hdr->pts, (long long)hdr->dts);
+                const uint8_t* p_frame_data = (const uint8_t*)hdr + hdr->version;
+                const uint8_t* p_extra = p_frame_data + hdr->data_size;
+                hexdump(p_frame_data, hdr->data_size, "data (inizio)");
+                if (hdr->extra_data_size) hexdump(p_extra, hdr->extra_data_size, "extra_data (inizio)");
+            } else {
+                fprintf(stderr, "  (non compresso o p_data nullo -- FourCC non H264/HEVC)\n");
+            }
+            shown++;
+            NDIlib_recv_free_video_v2(pRecv, &vf);
+        } else if (ft == NDIlib_frame_type_audio) {
+            NDIlib_recv_free_audio_v2(pRecv, &af);
+        } else if (ft == NDIlib_frame_type_metadata) {
+            fprintf(stderr, "  [metadata] %s\n", mf.p_data ? mf.p_data : "(null)");
+            NDIlib_recv_free_metadata(pRecv, &mf);
+        }
+    }
+
+    NDIlib_recv_destroy(pRecv);
+    NDIlib_find_destroy(pFind);
+    NDIlib_destroy();
+    return 0;
+}
+```
+
+---
+
+## File: `.github/workflows/ci.yml`
+
+```yaml
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: bash -n (syntax check)
+        run: |
+          for f in *.sh; do bash -n "$f"; done
+      - name: shellcheck
+        uses: ludeeus/action-shellcheck@master
+        with:
+          scandir: '.'
+          severity: warning
+```
+
