@@ -1,0 +1,34 @@
+# rodecaster-ndi-hx
+
+> Trasforma una webcam USB su Raspberry Pi 4 in una sorgente NDI|HX vera (H.264 via encoder
+> hardware bcm2835-codec), scrivendo pacchetti compressi direttamente con l'NDI Advanced SDK
+> invece di affidarsi al percorso NDI standard/SpeedHQ. Nato per interoperare con un
+> RØDECaster Video, che accetta solo NDI|HX2+ certificato. Licenza MIT; l'NDI Advanced SDK
+> necessario per compilare non è incluso (proprietario Vizrt/NDI, si scarica da ndi.video).
+
+Progetto italiano. Il README documenta 6 bug non ovvi scoperti facendo reverse engineering
+del wire format compresso dell'NDI Advanced SDK contro un receiver certificato reale (formato
+Annex-B vs AVCC, semantica dei FourCC lowest/highest bandwidth, campi obbligatori del frame
+compresso, profilo H.264 dell'encoder hardware) — la parte di maggior valore per chi arriva
+qui da una ricerca su un errore simile.
+
+## Documentazione
+
+- [README](README.md): overview, requisiti, build, uso, e i 6 bug non ovvi con le relative fix
+- [llms-full.txt](llms-full.txt): tutto il contenuto del repository (README + sorgenti +
+  script + config) consolidato in un solo file, per chi vuole il contesto completo senza
+  seguire i link qui sotto
+- [LICENSE](LICENSE): MIT
+
+## Codice
+
+- [ndi_hx_send.cpp](ndi_hx_send.cpp): il sender — legge H.264 Annex-B da stdin e lo pubblica
+  come pacchetto NDI compresso (NDI|HX)
+- [ndi_hx_inspect.cpp](ndi_hx_inspect.cpp): tool diagnostico, si collega a una sorgente NDI in
+  modalità COMPRESSED e stampa la struttura reale dei pacchetti ricevuti
+- [build_hx.sh](build_hx.sh): compila ndi_hx_send contro l'NDI Advanced SDK
+- [build_inspect.sh](build_inspect.sh): compila ndi_hx_inspect
+- [capture_cam_hx.sh](capture_cam_hx.sh): pipeline completa webcam → ffmpeg (encoder hardware
+  H.264) → ndi_hx_send
+- [ndi-webcam-send.service](ndi-webcam-send.service): unit systemd di esempio per farlo
+  partire al boot

@@ -138,7 +138,10 @@ per compilarlo **non è incluso** ed è soggetto alla licenza propria di Vizrt/N
 
 ## Per assistenti/agenti AI
 
-[`llms-full.txt`](llms-full.txt) contiene il contenuto integrale di questo repository
-(README, sorgenti, script, config) consolidato in un unico file di testo, secondo la
-convenzione [llms-full.txt](https://llmstxt.org/) — comodo da dare in pasto a un LLM senza
-dover seguire link o clonare la repo.
+Due file pensati per essere letti da un LLM, secondo la convenzione [llms.txt](https://llmstxt.org/):
+
+- [`llms.txt`](llms.txt) — versione leggera: solo indice e link ai file rilevanti, con una
+  riga di descrizione ciascuno
+- [`llms-full.txt`](llms-full.txt) — versione completa: contenuto integrale di README,
+  sorgenti, script e config consolidato in un unico file, senza bisogno di seguire link o
+  clonare la repo
