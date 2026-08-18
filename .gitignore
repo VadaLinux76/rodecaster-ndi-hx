@@ -5,6 +5,12 @@ ndi-sdk/
 # Binari compilati
 ndi_hx_send
 ndi_hx_inspect
+test_annexb
+test_annexb_san
+test_annexb_sanitized
+
+# Directory di build CMake
+build/
 
 # Editor/OS
 *.o

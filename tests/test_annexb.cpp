@@ -56,6 +56,19 @@ static void append_start_code(std::vector<uint8_t>* out, int len) {
     out->push_back(1);
 }
 
+// Costruisce un NAL slice minimale con un first_mb_in_slice specifico codificato come ue(v)
+// (Tabella 9-2 H.264). Copre solo i valori piccoli usati nei test.
+static std::vector<uint8_t> make_slice(int nal_type, uint32_t first_mb, uint8_t tail_byte = 0xAA) {
+    uint8_t ue_byte;
+    switch (first_mb) {
+        case 0: ue_byte = 0x80; break; // ue(v) "1"
+        case 1: ue_byte = 0x40; break; // ue(v) "010"
+        case 2: ue_byte = 0x60; break; // ue(v) "011"
+        default: ue_byte = 0x80; break;
+    }
+    return {(uint8_t)nal_type, ue_byte, tail_byte};
+}
+
 // ============================================================================================
 // NalReader
 // ============================================================================================
@@ -145,30 +158,90 @@ TEST(nalreader_no_start_code_never_returns_a_nal) {
 }
 
 // ============================================================================================
+// RbspBitReader / parse_first_mb_in_slice
+// ============================================================================================
+
+TEST(rbsp_bitreader_removes_emulation_prevention_bytes) {
+    // RBSP "vera" prima dell'escaping: AB 00 00 01 CD (contiene "00 00 01", che nei NAL H.264
+    // e' sempre preceduto da uno 0x03 di stuffing per non essere confuso con uno start code).
+    std::vector<uint8_t> encoded = {0xAB, 0x00, 0x00, 0x03, 0x01, 0xCD};
+    annexb::RbspBitReader r(encoded.data(), encoded.size());
+    uint32_t v;
+    CHECK(r.read_bits(8, &v)); CHECK_EQ(v, 0xABu);
+    CHECK(r.read_bits(8, &v)); CHECK_EQ(v, 0x00u);
+    CHECK(r.read_bits(8, &v)); CHECK_EQ(v, 0x00u);
+    CHECK(r.read_bits(8, &v)); CHECK_EQ(v, 0x01u); // lo 0x03 e' stato rimosso automaticamente
+    CHECK(r.read_bits(8, &v)); CHECK_EQ(v, 0xCDu);
+    CHECK(!r.read_bits(8, &v)); // dati finiti
+}
+
+TEST(rbsp_bitreader_ue_golomb_table) {
+    // Tabella 9-2 H.264: 0->"1", 1->"010", 2->"011", 3->"00100", 4->"00101".
+    struct Case { std::vector<uint8_t> bytes; uint32_t expected; };
+    const Case cases[] = {
+        {{0x80}, 0},             // "1"
+        {{0x40}, 1},             // "010"
+        {{0x60}, 2},             // "011"
+        {{0x24, 0x00}, 3},       // "00100"
+        {{0x28, 0x00}, 4},       // "00101"
+    };
+    for (const auto& c : cases) {
+        annexb::RbspBitReader r(c.bytes.data(), c.bytes.size());
+        uint32_t v = 0xFFFFFFFFu;
+        CHECK(r.read_ue(&v));
+        CHECK_EQ(v, c.expected);
+    }
+}
+
+TEST(parse_first_mb_in_slice_common_values) {
+    uint32_t v;
+    CHECK(annexb::parse_first_mb_in_slice(make_slice(1, 0), &v));
+    CHECK_EQ(v, 0u);
+    CHECK(annexb::parse_first_mb_in_slice(make_slice(1, 1), &v));
+    CHECK_EQ(v, 1u);
+    CHECK(annexb::parse_first_mb_in_slice(make_slice(1, 2), &v));
+    CHECK_EQ(v, 2u);
+}
+
+TEST(parse_first_mb_in_slice_too_short_fails_gracefully) {
+    uint32_t v;
+    std::vector<uint8_t> too_short = {0x41}; // solo l'header NAL, nessun bit di slice_header
+    CHECK(!annexb::parse_first_mb_in_slice(too_short, &v));
+    std::vector<uint8_t> empty_nal;
+    CHECK(!annexb::parse_first_mb_in_slice(empty_nal, &v));
+}
+
+// ============================================================================================
 // FrameAssembler
 // ============================================================================================
 
 // Copre: "SPS e PPS ripetuti" — l'extradata non deve restare "stale" al giro successivo.
+// Nota sulla latenza: feed_nal() restituisce l'access unit PRECEDENTE quando ne inizia uno
+// nuovo (vedi annexb.h), quindi qui servono due IDR e un flush() finale per osservare entrambi
+// gli extradata.
 TEST(assembler_repeated_sps_pps_updates_extradata) {
     annexb::FrameAssembler a;
     annexb::AssembledFrame out;
 
     std::vector<uint8_t> sps1 = {0x07, 0x11, 0x22};
     std::vector<uint8_t> pps1 = {0x08, 0x33};
-    std::vector<uint8_t> idr  = {0x05, 0x99};
+    std::vector<uint8_t> idr1 = make_slice(5, 0);
 
     CHECK(!a.feed_nal(sps1, 30, 1, &out));
     CHECK(!a.feed_nal(pps1, 30, 1, &out));
-    CHECK(a.feed_nal(idr, 30, 1, &out));
-    CHECK(out.is_keyframe);
-    CHECK(!out.extra_data.empty());
-    std::vector<uint8_t> first_extradata = out.extra_data;
+    CHECK(!a.feed_nal(idr1, 30, 1, &out)); // apre il primo AU, niente ancora da emettere
 
     std::vector<uint8_t> sps2 = {0x07, 0x44, 0x55, 0x66}; // SPS "diverso" (piu' lungo)
     std::vector<uint8_t> pps2 = {0x08, 0x77};
+    std::vector<uint8_t> idr2 = make_slice(5, 0);
     CHECK(!a.feed_nal(sps2, 30, 1, &out));
     CHECK(!a.feed_nal(pps2, 30, 1, &out));
-    CHECK(a.feed_nal(idr, 30, 1, &out));
+    CHECK(a.feed_nal(idr2, 30, 1, &out)); // chiude e restituisce il primo AU (con extradata1)
+    CHECK(out.is_keyframe);
+    std::vector<uint8_t> first_extradata = out.extra_data;
+    CHECK(!first_extradata.empty());
+
+    CHECK(a.flush(30, 1, &out)); // restituisce il secondo AU (con extradata2)
     CHECK(out.is_keyframe);
     CHECK(!(out.extra_data == first_extradata));
 }
@@ -177,17 +250,15 @@ TEST(assembler_repeated_sps_pps_updates_extradata) {
 TEST(assembler_idr_without_params_is_not_a_keyframe) {
     annexb::FrameAssembler a;
     annexb::AssembledFrame out;
-    std::vector<uint8_t> idr = {0x05, 0x99};
-    CHECK(a.feed_nal(idr, 30, 1, &out));
-    CHECK(!out.is_keyframe);
+    CHECK(!a.feed_nal(make_slice(5, 0), 30, 1, &out)); // apre l'AU, niente da emettere ancora
+    CHECK(a.flush(30, 1, &out));
+    CHECK(!out.is_keyframe); // niente SPS/PPS ancora: non va marcato come keyframe
     CHECK(out.extra_data.empty());
 }
 
-// Copre: "frame con piu' slice". Limite noto (vedi annexb.h): l'assembler NON ricompone piu'
-// slice in un'unica access unit. Questo test fissa il comportamento ATTUALE, cosi' che un
-// eventuale supporto multi-slice futuro sia una scelta esplicita e non una regressione
-// silenziosa scoperta troppo tardi.
-TEST(assembler_multi_slice_known_limitation_emits_separate_frames) {
+// Copre: "frame con piu' slice", risolto in fase 3. Due slice con first_mb_in_slice 0 poi !=0
+// (quindi la seconda e' una continuazione) devono confluire in UN SOLO access unit.
+TEST(assembler_multi_slice_merged_into_one_access_unit) {
     annexb::FrameAssembler a;
     annexb::AssembledFrame out;
     std::vector<uint8_t> sps = {0x07, 0x11};
@@ -195,20 +266,63 @@ TEST(assembler_multi_slice_known_limitation_emits_separate_frames) {
     a.feed_nal(sps, 30, 1, &out);
     a.feed_nal(pps, 30, 1, &out);
 
-    std::vector<uint8_t> slice1 = {0x01, 0xAA}; // due slice dello stesso frame reale
-    std::vector<uint8_t> slice2 = {0x01, 0xBB};
-    CHECK(a.feed_nal(slice1, 30, 1, &out));
+    std::vector<uint8_t> f1_slice1 = make_slice(1, 0, 0xAA); // apre il frame 1
+    std::vector<uint8_t> f1_slice2 = make_slice(1, 1, 0xBB); // continuazione dello stesso frame
+    CHECK(!a.feed_nal(f1_slice1, 30, 1, &out));
+    CHECK(!a.feed_nal(f1_slice2, 30, 1, &out));
+    CHECK_EQ(a.frames_emitted(), (uint64_t)0); // ancora nulla emesso: il frame 1 e' ancora aperto
+
+    std::vector<uint8_t> f2_slice1 = make_slice(1, 0, 0xCC); // apre il frame 2, chiude il frame 1
+    CHECK(a.feed_nal(f2_slice1, 30, 1, &out));
     CHECK_EQ(a.frames_emitted(), (uint64_t)1);
-    CHECK(a.feed_nal(slice2, 30, 1, &out));
-    CHECK_EQ(a.frames_emitted(), (uint64_t)2); // atteso oggi: 2 frame invece di 1 solo
+    // Il frame 1 restituito deve contenere ENTRAMBE le slice (Annex-B: start code + NAL x2).
+    const size_t expected_min = f1_slice1.size() + f1_slice2.size() + 4 + 4;
+    CHECK(out.data.size() == expected_min);
+
+    CHECK(a.flush(30, 1, &out)); // il frame 2 (una sola slice) resta in sospeso fino a qui
+    CHECK_EQ(a.frames_emitted(), (uint64_t)2);
+    CHECK(out.data.size() == f2_slice1.size() + 4);
 }
 
-// Copre: "dati troncati o malformati" lato assembler (NAL vuoto).
+// Copre lo stesso scenario di sopra ma usando un Access Unit Delimiter invece di affidarsi a
+// first_mb_in_slice: un AUD deve forzare l'apertura di un nuovo AU alla slice successiva a
+// prescindere da cosa dice first_mb_in_slice.
+TEST(assembler_aud_forces_new_access_unit) {
+    annexb::FrameAssembler a;
+    annexb::AssembledFrame out;
+    std::vector<uint8_t> aud = {0x09, 0xF0}; // NAL tipo 9 = Access Unit Delimiter
+
+    CHECK(!a.feed_nal(make_slice(1, 0), 30, 1, &out)); // apre il frame 1
+    CHECK(!a.feed_nal(aud, 30, 1, &out));               // AUD: la prossima slice apre un nuovo AU
+    // first_mb_in_slice=1 normalmente significherebbe "continuazione", ma l'AUD vince comunque.
+    CHECK(a.feed_nal(make_slice(1, 1), 30, 1, &out));
+    CHECK_EQ(a.frames_emitted(), (uint64_t)1);
+}
+
+// Copre: "dati troncati o malformati" lato assembler — un NAL slice troppo corto per contenere
+// first_mb_in_slice viene trattato, per prudenza, come inizio di un nuovo access unit: chiude
+// (e restituisce) l'AU precedente invece di rischiare di fondervi dati corrotti.
+TEST(assembler_malformed_slice_closes_previous_au) {
+    annexb::FrameAssembler a;
+    annexb::AssembledFrame out;
+    CHECK(!a.feed_nal(make_slice(1, 0), 30, 1, &out)); // apre il frame 1 (valido)
+
+    std::vector<uint8_t> too_short = {0x01}; // solo l'header NAL: parse_first_mb_in_slice fallisce
+    CHECK(a.feed_nal(too_short, 30, 1, &out)); // chiude e restituisce il frame 1
+    CHECK_EQ(a.frames_emitted(), (uint64_t)1);
+}
+
 TEST(assembler_empty_nal_is_ignored_without_crashing) {
     annexb::FrameAssembler a;
     annexb::AssembledFrame out;
     std::vector<uint8_t> empty;
     CHECK(!a.feed_nal(empty, 30, 1, &out));
+}
+
+TEST(assembler_flush_with_nothing_pending_returns_false) {
+    annexb::FrameAssembler a;
+    annexb::AssembledFrame out;
+    CHECK(!a.flush(30, 1, &out));
 }
 
 // Copre: "sequenze molto grandi e possibili overflow" — un NAL di alcuni MB e molte migliaia
@@ -223,18 +337,23 @@ TEST(assembler_large_nal_and_long_sequence) {
 
     std::vector<uint8_t> big_slice;
     big_slice.push_back(0x01);
-    big_slice.resize(1 + 4 * 1024 * 1024, 0xEE);
-    CHECK(a.feed_nal(big_slice, 30, 1, &out));
-    CHECK_EQ(out.data.size(), big_slice.size() + 4 /* start code */);
+    big_slice.push_back(0x80); // first_mb_in_slice = 0 (apre l'AU)
+    big_slice.resize(2 + 4 * 1024 * 1024, 0xEE);
+    CHECK(!a.feed_nal(big_slice, 30, 1, &out)); // apre l'AU: niente ancora da emettere
 
-    std::vector<uint8_t> slice = {0x01, 0x00};
-    int64_t prev_pts = out.pts_hns;
+    std::vector<uint8_t> slice = make_slice(1, 0); // ogni chiamata apre (e quindi chiude la
+                                                     // precedente) un nuovo access unit da 1 slice
+    int64_t prev_pts = -1;
     for (int i = 0; i < 10000; i++) {
-        CHECK(a.feed_nal(slice, 30, 1, &out));
-        CHECK(out.pts_hns >= prev_pts);
-        prev_pts = out.pts_hns;
+        const bool got = a.feed_nal(slice, 30, 1, &out);
+        CHECK(got); // dalla seconda chiamata in poi (compresa quella che chiude big_slice) sempre vero
+        if (got) {
+            CHECK(out.pts_hns >= prev_pts);
+            prev_pts = out.pts_hns;
+        }
     }
-    // SPS/PPS non emettono frame: solo big_slice + i 10000 slice del loop contano.
+    CHECK(a.flush(30, 1, &out)); // l'ultimo AU della sequenza resta in sospeso finche' non si fa flush
+    // big_slice + i primi 9999 "slice" del loop chiusi via feed_nal, l'ultimo via flush: 1 + 10000.
     CHECK_EQ(a.frames_emitted(), (uint64_t)(1 + 10000));
 }
 

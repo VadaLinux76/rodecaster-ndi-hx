@@ -46,6 +46,12 @@ debugging, in modo che chi ci si scontra dopo non debba rifarla da zero.
 ./build_inspect.sh    # -> ndi_hx_inspect (tool diagnostico, opzionale)
 ```
 
+Se l'SDK ha più sottocartelle `lib/<arch>` (un pacchetto multi-architettura), viene scelta
+automaticamente quella che corrisponde all'host (`uname -m`); per bypassare il rilevamento e
+sceglierne una esplicitamente, imposta `NDI_SDK_LIBDIR=/path/esatto`.
+
+In alternativa, [CMake](#build-con-cmake) offre gli stessi target più `ctest`/`install`.
+
 ## Architettura del codice
 
 Il parsing dello stream Annex-B e la ricostruzione delle access unit vivono in
@@ -65,6 +71,19 @@ g++ -std=c++17 -O1 -g -fsanitize=address,undefined -o test_annexb_san tests/test
 ./test_annexb_san
 ```
 
+### Build con CMake
+
+Alternativa agli script bash sopra, con target `build`/`test`/`install` standard. Gli script
+restano comunque il modo più semplice per chi non vuole installare CMake.
+
+```bash
+# solo il modulo annexb + i test (nessun SDK richiesto)
+cmake -B build && cmake --build build && ctest --test-dir build --output-on-failure
+
+# anche ndi_hx_send/ndi_hx_inspect, collegati contro l'SDK indicato
+cmake -B build -DNDI_SDK_DIR=/path/to/ndi-adv-sdk && cmake --build build
+```
+
 ## Uso
 
 ```bash
@@ -72,6 +91,11 @@ g++ -std=c++17 -O1 -g -fsanitize=address,undefined -o test_annexb_san tests/test
 
 # esempio:
 ./capture_cam_hx.sh /dev/video0 1920 1080 30 "Pi4 Cam HX" 8M 2
+
+# <fps> accetta anche una frazione N/D (es. 30000/1001, il classico "29.97fps" NTSC) — solo se
+# la webcam supporta davvero quel preciso frame interval, verificalo con
+# `v4l2-ctl --list-formats-ext`
+./capture_cam_hx.sh /dev/video0 1920 1080 30000/1001 "Pi4 Cam HX" 8M 2
 ```
 
 Per farlo partire al boot, copia `ndi-webcam-send.service` in `/etc/systemd/system/`
@@ -151,10 +175,15 @@ sopravvissuti a lungo ai test locali.
   `ndi_hx_inspect.cpp` per intero: l'SDK NDI Advanced non è scaricabile automaticamente in CI
   (richiede registrazione manuale su ndi.video), e sono proprio quei due file gli unici a
   dipenderne — è anche il motivo per cui la logica delicata è stata estratta in `annexb`.
-- **`ndi_hx_send` assume un NAL slice = un frame completo** (nessun supporto per access unit
-  composte da più slice). Funziona perché l'encoder hardware del Pi4 (`h264_v4l2m2m`) non fa
-  slicing, ma non è un'assunzione valida per qualunque encoder H.264 in generale — se sostituisci
-  la sorgente con un encoder che produce più slice per frame, il video arriverà spezzato.
+- **Access unit multi-slice**: `ndi_hx_send` le ricompone correttamente (via Access Unit
+  Delimiter quando presente, o leggendo `first_mb_in_slice` dallo slice header quando assente —
+  vedi `annexb.h`). Questo introduce una latenza di un access unit: un frame viene inviato solo
+  quando arriva la prima slice di quello successivo, o a fine stream. Con l'encoder hardware del
+  Pi4 (`h264_v4l2m2m`, che non fa slicing) la latenza aggiuntiva è quindi trascurabile.
+- La CI (badge sopra) verifica anche la build via CMake, ma solo la parte che non dipende
+  dall'SDK NDI (modulo `annexb` + test): `ndi_hx_send`/`ndi_hx_inspect` via CMake richiedono
+  `-DNDI_SDK_DIR=...` e non vengono quindi compilati automaticamente in CI, per lo stesso
+  motivo del punto sopra.
 
 ## Debug
 

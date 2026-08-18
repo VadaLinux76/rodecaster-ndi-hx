@@ -28,9 +28,11 @@
 //   piu' basso". Per il flusso principale a risoluzione piena va sempre usato
 //   "highest_bandwidth", qualunque sia la risoluzione reale inviata.
 //
-// Limite noto: un NAL di tipo slice (1 o 5) e' trattato come un frame completo — nessun
-// supporto per access unit composte da piu' slice. Va bene con l'encoder hardware del Pi4
-// (h264_v4l2m2m, che non fa slicing) ma non e' un'assunzione valida per qualunque encoder.
+// Access unit multi-slice: annexb::FrameAssembler le ricompone correttamente (vedi annexb.h),
+// riconoscendo l'inizio di un nuovo frame via Access Unit Delimiter (quando presente) o
+// leggendo first_mb_in_slice dallo slice header. Questo introduce una latenza di un access
+// unit: un frame e' inviato solo quando arriva la prima slice di quello successivo, o a fine
+// stream (vedi il doppio flush prima della fine di main()).
 //
 // Variabile d'ambiente NDI_HX_DEBUG: se definita (a qualunque valore), scrive in
 // /tmp/hx_debug_* i byte grezzi del primo keyframe per ispezione con ffprobe/hexdump.
@@ -200,7 +202,16 @@ int main(int argc, char* argv[])
             break; // EOF (n==0) o errore di lettura su stdin (ffmpeg terminato)
         }
     }
-    if (reader.flush(&nal) && assembler.feed_nal(nal, fps_n, fps_d, &af)) send_frame(af);
+    // Due livelli di flush a EOF (code review: Codex, fase 3): reader.flush() recupera l'ultimo
+    // NAL del flusso (che next_nal() non puo' mai restituire da solo, vedi NalReader). Dandolo
+    // in pasto all'assembler puo' chiudere l'access unit PRECEDENTE (se quell'ultimo NAL apre
+    // un nuovo AU), ma l'ultimo access unit del flusso resta comunque in sospeso finche' non si
+    // chiama esplicitamente assembler.flush() (vedi FrameAssembler: un AU si chiude solo
+    // quando arriva la prima slice di quello dopo, o a fine stream).
+    if (reader.flush(&nal)) {
+        if (assembler.feed_nal(nal, fps_n, fps_d, &af)) send_frame(af);
+    }
+    if (assembler.flush(fps_n, fps_d, &af)) send_frame(af);
 
     fprintf(stderr, "Stream terminato. Inviati %llu frame.\n", (unsigned long long)frames_sent);
 

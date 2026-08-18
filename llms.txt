@@ -30,8 +30,13 @@ qui da una ricerca su un errore simile.
   modalità COMPRESSED e stampa la struttura reale dei pacchetti ricevuti
 - [build_hx.sh](build_hx.sh): compila ndi_hx_send (+ annexb.cpp) contro l'NDI Advanced SDK
 - [build_inspect.sh](build_inspect.sh): compila ndi_hx_inspect
+- [find-ndi-libdir.sh](find-ndi-libdir.sh): helper condiviso (sourceato dai due script sopra)
+  che seleziona la sottocartella lib/&lt;arch&gt; giusta per l'host, non semplicemente la prima
+- [CMakeLists.txt](CMakeLists.txt): sistema di build alternativo (target build/test/install via
+  CTest); costruisce sempre `annexb` + i test, `ndi_hx_send`/`ndi_hx_inspect` solo con
+  `-DNDI_SDK_DIR=...`
 - [capture_cam_hx.sh](capture_cam_hx.sh): pipeline completa webcam → ffmpeg (encoder hardware
-  H.264) → ndi_hx_send
+  H.264, fps intero o frazionario tipo 30000/1001) → ndi_hx_send
 - [ndi-webcam-send.service](ndi-webcam-send.service): unit systemd di esempio per farlo
   partire al boot
 

@@ -18,12 +18,9 @@ if [ ! -d "$NDI_SDK/include" ]; then
 fi
 
 # La cartella lib contiene una sottocartella per architettura (es. x86_64-linux-gnu,
-# aarch64-rpi4-linux-gnueabi su Raspberry Pi OS/Ubuntu). La prendiamo automaticamente.
-LIBDIR=$(find "$NDI_SDK/lib" -mindepth 1 -maxdepth 1 -type d | head -1)
-if [ -z "$LIBDIR" ]; then
-    echo "Nessuna sottocartella lib/<arch> trovata sotto $NDI_SDK/lib" >&2
-    exit 1
-fi
+# aarch64-rpi4-linux-gnueabi su Raspberry Pi OS/Ubuntu): la selezioniamo in base all'host.
+# shellcheck source=find-ndi-libdir.sh
+source "$(dirname "$0")/find-ndi-libdir.sh"
 
 g++ -std=c++17 -O2 -Wall \
     -I"$NDI_SDK/include" \

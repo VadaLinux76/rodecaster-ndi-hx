@@ -13,11 +13,8 @@ if [ ! -d "$NDI_SDK/include" ]; then
     exit 1
 fi
 
-LIBDIR=$(find "$NDI_SDK/lib" -mindepth 1 -maxdepth 1 -type d | head -1)
-if [ -z "$LIBDIR" ]; then
-    echo "Nessuna sottocartella lib/<arch> trovata sotto $NDI_SDK/lib" >&2
-    exit 1
-fi
+# shellcheck source=find-ndi-libdir.sh
+source "$(dirname "$0")/find-ndi-libdir.sh"
 
 g++ -std=c++17 -O2 -Wall \
     -I"$NDI_SDK/include" \

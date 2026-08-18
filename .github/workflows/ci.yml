@@ -37,7 +37,8 @@ jobs:
           fi
       - name: Build con warning severi (-Werror)
         run: |
-          ${{ matrix.compiler }} -std=c++17 -O2 -Wall -Wextra -Wpedantic -Wconversion -Werror \
+          ${{ matrix.compiler }} -std=c++17 -O2 -Wall -Wextra -Wpedantic -Wconversion \
+            -Wsign-conversion -Werror \
             -o test_annexb tests/test_annexb.cpp annexb.cpp
       - name: Esegui i test
         run: ./test_annexb
@@ -48,3 +49,18 @@ jobs:
             -o test_annexb_sanitized tests/test_annexb.cpp annexb.cpp
       - name: Esegui i test sotto sanitizer
         run: ./test_annexb_sanitized
+
+  # Verifica il sistema di build CMake (code review: Codex, fase 3 - "unificare le build con
+  # CMake o Meson, aggiungere target build/test"). L'SDK NDI non e' scaricabile in CI, quindi
+  # qui si costruisce solo cio' che non ne dipende (modulo annexb + test via CTest) -- gli
+  # script bash restano il modo supportato per compilare ndi_hx_send/ndi_hx_inspect in CI.
+  cmake-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configura
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build --verbose
+      - name: Test (CTest)
+        run: ctest --test-dir build --output-on-failure

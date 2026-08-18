@@ -10,8 +10,13 @@
 # Costo: bitrate piu' alto a parita' di qualita' (gli I-frame pesano piu' dei P-frame).
 #
 # Uso: ./capture_cam_hx.sh <device> <larghezza> <altezza> <fps> <nome_ndi> [bitrate] [gop_frame]
+# <fps> accetta sia un intero (30) sia una frazione N/D (30000/1001, il classico "29.97fps"
+# NTSC) -- va bene solo se la webcam supporta davvero quel preciso frame interval, verificalo
+# con `v4l2-ctl --list-formats-ext` (code review: Codex, fase 3 - "supportare frame rate
+# frazionari dalla CLI": prima veniva sempre passato 1 come denominatore a ndi_hx_send).
 # Esempio:
 #   ./capture_cam_hx.sh /dev/video0 1920 1080 30 "Pi4 Cam HX" 8M 2
+#   ./capture_cam_hx.sh /dev/video0 1920 1080 30000/1001 "Pi4 Cam HX" 8M 2
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -19,10 +24,18 @@ cd "$(dirname "$0")"
 DEVICE="${1:?device, es. /dev/video0}"
 WIDTH="${2:?larghezza, es. 1920}"
 HEIGHT="${3:?altezza, es. 1080}"
-FPS="${4:?fps, es. 30}"
+FPS="${4:?fps, es. 30 oppure 30000/1001}"
 NDI_NAME="${5:?nome sorgente NDI, es. \"Pi4 Cam HX\"}"
 BITRATE="${6:-8M}"
 GOP="${7:-2}"
+
+if [[ "$FPS" == */* ]]; then
+    FPS_N="${FPS%%/*}"
+    FPS_D="${FPS##*/}"
+else
+    FPS_N="$FPS"
+    FPS_D=1
+fi
 H264_PROFILE="${8:-77}" # AVCodecContext.profile: 66=Baseline 77=Main 100=High (default HW: 100/High)
 H264_LEVEL="${9:-31}"   # AVCodecContext.level *10: 31=Level 3.1, 40=Level 4.0
 
@@ -42,4 +55,4 @@ exec ffmpeg -hide_banner -loglevel warning \
     -num_capture_buffers 16 \
     -force_key_frames "expr:eq(mod(n,${GOP}),0)" \
     -f h264 - \
-| ./ndi_hx_send "$NDI_NAME" "$WIDTH" "$HEIGHT" "$FPS" 1 highest
+| ./ndi_hx_send "$NDI_NAME" "$WIDTH" "$HEIGHT" "$FPS_N" "$FPS_D" highest

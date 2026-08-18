@@ -63,6 +63,12 @@ debugging, in modo che chi ci si scontra dopo non debba rifarla da zero.
 ./build_inspect.sh    # -> ndi_hx_inspect (tool diagnostico, opzionale)
 ```
 
+Se l'SDK ha più sottocartelle `lib/<arch>` (un pacchetto multi-architettura), viene scelta
+automaticamente quella che corrisponde all'host (`uname -m`); per bypassare il rilevamento e
+sceglierne una esplicitamente, imposta `NDI_SDK_LIBDIR=/path/esatto`.
+
+In alternativa, [CMake](#build-con-cmake) offre gli stessi target più `ctest`/`install`.
+
 ## Architettura del codice
 
 Il parsing dello stream Annex-B e la ricostruzione delle access unit vivono in
@@ -82,6 +88,19 @@ g++ -std=c++17 -O1 -g -fsanitize=address,undefined -o test_annexb_san tests/test
 ./test_annexb_san
 ```
 
+### Build con CMake
+
+Alternativa agli script bash sopra, con target `build`/`test`/`install` standard. Gli script
+restano comunque il modo più semplice per chi non vuole installare CMake.
+
+```bash
+# solo il modulo annexb + i test (nessun SDK richiesto)
+cmake -B build && cmake --build build && ctest --test-dir build --output-on-failure
+
+# anche ndi_hx_send/ndi_hx_inspect, collegati contro l'SDK indicato
+cmake -B build -DNDI_SDK_DIR=/path/to/ndi-adv-sdk && cmake --build build
+```
+
 ## Uso
 
 ```bash
@@ -89,6 +108,11 @@ g++ -std=c++17 -O1 -g -fsanitize=address,undefined -o test_annexb_san tests/test
 
 # esempio:
 ./capture_cam_hx.sh /dev/video0 1920 1080 30 "Pi4 Cam HX" 8M 2
+
+# <fps> accetta anche una frazione N/D (es. 30000/1001, il classico "29.97fps" NTSC) — solo se
+# la webcam supporta davvero quel preciso frame interval, verificalo con
+# `v4l2-ctl --list-formats-ext`
+./capture_cam_hx.sh /dev/video0 1920 1080 30000/1001 "Pi4 Cam HX" 8M 2
 ```
 
 Per farlo partire al boot, copia `ndi-webcam-send.service` in `/etc/systemd/system/`
@@ -168,10 +192,15 @@ sopravvissuti a lungo ai test locali.
   `ndi_hx_inspect.cpp` per intero: l'SDK NDI Advanced non è scaricabile automaticamente in CI
   (richiede registrazione manuale su ndi.video), e sono proprio quei due file gli unici a
   dipenderne — è anche il motivo per cui la logica delicata è stata estratta in `annexb`.
-- **`ndi_hx_send` assume un NAL slice = un frame completo** (nessun supporto per access unit
-  composte da più slice). Funziona perché l'encoder hardware del Pi4 (`h264_v4l2m2m`) non fa
-  slicing, ma non è un'assunzione valida per qualunque encoder H.264 in generale — se sostituisci
-  la sorgente con un encoder che produce più slice per frame, il video arriverà spezzato.
+- **Access unit multi-slice**: `ndi_hx_send` le ricompone correttamente (via Access Unit
+  Delimiter quando presente, o leggendo `first_mb_in_slice` dallo slice header quando assente —
+  vedi `annexb.h`). Questo introduce una latenza di un access unit: un frame viene inviato solo
+  quando arriva la prima slice di quello successivo, o a fine stream. Con l'encoder hardware del
+  Pi4 (`h264_v4l2m2m`, che non fa slicing) la latenza aggiuntiva è quindi trascurabile.
+- La CI (badge sopra) verifica anche la build via CMake, ma solo la parte che non dipende
+  dall'SDK NDI (modulo `annexb` + test): `ndi_hx_send`/`ndi_hx_inspect` via CMake richiedono
+  `-DNDI_SDK_DIR=...` e non vengono quindi compilati automaticamente in CI, per lo stesso
+  motivo del punto sopra.
 
 ## Debug
 
@@ -236,8 +265,13 @@ qui da una ricerca su un errore simile.
   modalità COMPRESSED e stampa la struttura reale dei pacchetti ricevuti
 - [build_hx.sh](build_hx.sh): compila ndi_hx_send (+ annexb.cpp) contro l'NDI Advanced SDK
 - [build_inspect.sh](build_inspect.sh): compila ndi_hx_inspect
+- [find-ndi-libdir.sh](find-ndi-libdir.sh): helper condiviso (sourceato dai due script sopra)
+  che seleziona la sottocartella lib/&lt;arch&gt; giusta per l'host, non semplicemente la prima
+- [CMakeLists.txt](CMakeLists.txt): sistema di build alternativo (target build/test/install via
+  CTest); costruisce sempre `annexb` + i test, `ndi_hx_send`/`ndi_hx_inspect` solo con
+  `-DNDI_SDK_DIR=...`
 - [capture_cam_hx.sh](capture_cam_hx.sh): pipeline completa webcam → ffmpeg (encoder hardware
-  H.264) → ndi_hx_send
+  H.264, fps intero o frazionario tipo 30000/1001) → ndi_hx_send
 - [ndi-webcam-send.service](ndi-webcam-send.service): unit systemd di esempio per farlo
   partire al boot
 
@@ -287,6 +321,12 @@ ndi-sdk/
 # Binari compilati
 ndi_hx_send
 ndi_hx_inspect
+test_annexb
+test_annexb_san
+test_annexb_sanitized
+
+# Directory di build CMake
+build/
 
 # Editor/OS
 *.o
@@ -336,8 +376,13 @@ WantedBy=multi-user.target
 # Costo: bitrate piu' alto a parita' di qualita' (gli I-frame pesano piu' dei P-frame).
 #
 # Uso: ./capture_cam_hx.sh <device> <larghezza> <altezza> <fps> <nome_ndi> [bitrate] [gop_frame]
+# <fps> accetta sia un intero (30) sia una frazione N/D (30000/1001, il classico "29.97fps"
+# NTSC) -- va bene solo se la webcam supporta davvero quel preciso frame interval, verificalo
+# con `v4l2-ctl --list-formats-ext` (code review: Codex, fase 3 - "supportare frame rate
+# frazionari dalla CLI": prima veniva sempre passato 1 come denominatore a ndi_hx_send).
 # Esempio:
 #   ./capture_cam_hx.sh /dev/video0 1920 1080 30 "Pi4 Cam HX" 8M 2
+#   ./capture_cam_hx.sh /dev/video0 1920 1080 30000/1001 "Pi4 Cam HX" 8M 2
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -345,10 +390,18 @@ cd "$(dirname "$0")"
 DEVICE="${1:?device, es. /dev/video0}"
 WIDTH="${2:?larghezza, es. 1920}"
 HEIGHT="${3:?altezza, es. 1080}"
-FPS="${4:?fps, es. 30}"
+FPS="${4:?fps, es. 30 oppure 30000/1001}"
 NDI_NAME="${5:?nome sorgente NDI, es. \"Pi4 Cam HX\"}"
 BITRATE="${6:-8M}"
 GOP="${7:-2}"
+
+if [[ "$FPS" == */* ]]; then
+    FPS_N="${FPS%%/*}"
+    FPS_D="${FPS##*/}"
+else
+    FPS_N="$FPS"
+    FPS_D=1
+fi
 H264_PROFILE="${8:-77}" # AVCodecContext.profile: 66=Baseline 77=Main 100=High (default HW: 100/High)
 H264_LEVEL="${9:-31}"   # AVCodecContext.level *10: 31=Level 3.1, 40=Level 4.0
 
@@ -368,7 +421,7 @@ exec ffmpeg -hide_banner -loglevel warning \
     -num_capture_buffers 16 \
     -force_key_frames "expr:eq(mod(n,${GOP}),0)" \
     -f h264 - \
-| ./ndi_hx_send "$NDI_NAME" "$WIDTH" "$HEIGHT" "$FPS" 1 highest
+| ./ndi_hx_send "$NDI_NAME" "$WIDTH" "$HEIGHT" "$FPS_N" "$FPS_D" highest
 ```
 
 ---
@@ -396,12 +449,9 @@ if [ ! -d "$NDI_SDK/include" ]; then
 fi
 
 # La cartella lib contiene una sottocartella per architettura (es. x86_64-linux-gnu,
-# aarch64-rpi4-linux-gnueabi su Raspberry Pi OS/Ubuntu). La prendiamo automaticamente.
-LIBDIR=$(find "$NDI_SDK/lib" -mindepth 1 -maxdepth 1 -type d | head -1)
-if [ -z "$LIBDIR" ]; then
-    echo "Nessuna sottocartella lib/<arch> trovata sotto $NDI_SDK/lib" >&2
-    exit 1
-fi
+# aarch64-rpi4-linux-gnueabi su Raspberry Pi OS/Ubuntu): la selezioniamo in base all'host.
+# shellcheck source=find-ndi-libdir.sh
+source "$(dirname "$0")/find-ndi-libdir.sh"
 
 g++ -std=c++17 -O2 -Wall \
     -I"$NDI_SDK/include" \
@@ -433,11 +483,8 @@ if [ ! -d "$NDI_SDK/include" ]; then
     exit 1
 fi
 
-LIBDIR=$(find "$NDI_SDK/lib" -mindepth 1 -maxdepth 1 -type d | head -1)
-if [ -z "$LIBDIR" ]; then
-    echo "Nessuna sottocartella lib/<arch> trovata sotto $NDI_SDK/lib" >&2
-    exit 1
-fi
+# shellcheck source=find-ndi-libdir.sh
+source "$(dirname "$0")/find-ndi-libdir.sh"
 
 g++ -std=c++17 -O2 -Wall \
     -I"$NDI_SDK/include" \
@@ -448,6 +495,166 @@ g++ -std=c++17 -O2 -Wall \
 
 echo "Build OK -> ./ndi_hx_inspect (linkato contro $LIBDIR)"
 ```
+
+---
+
+## File: `find-ndi-libdir.sh`
+
+```bash
+# Da "sourceare" (non eseguire) dagli script di build dopo aver impostato NDI_SDK. Popola la
+# variabile LIBDIR con la sottocartella lib/<arch> giusta per l'host corrente, invece di
+# prendere semplicemente "la prima trovata" (code review: Codex, fase 3 - "rilevare
+# architettura e ABI del compilatore, selezionare esplicitamente la libreria corretta": con un
+# SDK multi-architettura estratto in un'unica cartella, la prima trovata potrebbe non
+# corrispondere all'host e produrre un binario che non parte, o non parte affatto).
+#
+# Override manuale: imposta NDI_SDK_LIBDIR per saltare del tutto il rilevamento automatico.
+
+if [ -n "${NDI_SDK_LIBDIR:-}" ]; then
+    LIBDIR="$NDI_SDK_LIBDIR"
+    if [ ! -d "$LIBDIR" ]; then
+        echo "NDI_SDK_LIBDIR punta a una cartella inesistente: $LIBDIR" >&2
+        exit 1
+    fi
+else
+    CANDIDATES=("$NDI_SDK"/lib/*/)
+    if [ ! -d "${CANDIDATES[0]}" ]; then
+        echo "Nessuna sottocartella lib/<arch> trovata sotto $NDI_SDK/lib" >&2
+        exit 1
+    fi
+
+    if [ ${#CANDIDATES[@]} -eq 1 ]; then
+        LIBDIR="${CANDIDATES[0]%/}"
+    else
+        # Piu' di una sottocartella (SDK multi-architettura): cerca quella il cui nome
+        # contiene l'architettura host rilevata (es. "aarch64" o "x86_64").
+        HOST_ARCH="$(uname -m)"
+        LIBDIR=""
+        for d in "${CANDIDATES[@]}"; do
+            d="${d%/}"
+            if [[ "$(basename "$d")" == *"$HOST_ARCH"* ]]; then
+                LIBDIR="$d"
+                break
+            fi
+        done
+        if [ -z "$LIBDIR" ]; then
+            echo "SDK multi-architettura: nessuna sottocartella lib/ corrisponde all'host ($HOST_ARCH)." >&2
+            echo "Trovate: ${CANDIDATES[*]}" >&2
+            echo "Imposta NDI_SDK_LIBDIR per sceglierne una esplicitamente." >&2
+            exit 1
+        fi
+    fi
+fi
+```
+
+---
+
+## File: `CMakeLists.txt`
+
+# Sistema di build alternativo agli script bash (build_hx.sh/build_inspect.sh), che restano
+# invariati per chi preferisce non installare CMake (code review: Codex, fase 3 - "unificare le
+# build con CMake o Meson, aggiungere target build/test/install, mantenere gli script attuali
+# come semplici wrapper se utili agli utenti meno esperti").
+#
+# Uso:
+#   cmake -B build && cmake --build build && ctest --test-dir build
+#     -> costruisce solo il modulo annexb (nessuna dipendenza dall'SDK NDI) e i suoi test.
+#
+#   cmake -B build -DNDI_SDK_DIR=/path/to/ndi-adv-sdk && cmake --build build
+#     -> costruisce anche ndi_hx_send e ndi_hx_inspect, collegati contro l'SDK indicato.
+#        Se la cartella lib/ dell'SDK contiene piu' sottocartelle per architetture diverse,
+#        quella giusta viene scelta in base a CMAKE_SYSTEM_PROCESSOR; per bypassare la
+#        selezione automatica passa anche -DNDI_SDK_LIBDIR=/path/esatto.
+
+cmake_minimum_required(VERSION 3.16)
+project(rodecaster-ndi-hx CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release)
+endif()
+
+add_compile_options(-Wall -Wextra -Wpedantic)
+
+# --- Modulo annexb: nessuna dipendenza dall'SDK NDI, sempre costruito -------------------------
+add_library(annexb STATIC annexb.cpp annexb.h)
+target_include_directories(annexb PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+
+# --- Test (CTest) -------------------------------------------------------------------------------
+enable_testing()
+add_executable(test_annexb tests/test_annexb.cpp)
+target_link_libraries(test_annexb PRIVATE annexb)
+target_compile_options(test_annexb PRIVATE -Wconversion -Wsign-conversion -Werror)
+add_test(NAME annexb_unit_tests COMMAND test_annexb)
+
+# --- ndi_hx_send / ndi_hx_inspect: solo se viene indicato l'SDK NDI Advanced -------------------
+# L'SDK e' proprietario e non e' incluso in questo repo (vedi README): senza -DNDI_SDK_DIR=...
+# `cmake --build` costruisce comunque annexb e i test, semplicemente salta questi due target.
+if(DEFINED NDI_SDK_DIR)
+    if(NOT EXISTS "${NDI_SDK_DIR}/include")
+        message(FATAL_ERROR "NDI_SDK_DIR='${NDI_SDK_DIR}' non contiene una cartella include/")
+    endif()
+
+    if(DEFINED NDI_SDK_LIBDIR)
+        set(_ndi_libdir "${NDI_SDK_LIBDIR}")
+    else()
+        file(GLOB _ndi_lib_candidates LIST_DIRECTORIES true "${NDI_SDK_DIR}/lib/*")
+        set(_ndi_libdir "")
+        set(_ndi_libdir_fallback "")
+        foreach(_cand ${_ndi_lib_candidates})
+            if(IS_DIRECTORY "${_cand}")
+                if(_ndi_libdir_fallback STREQUAL "")
+                    set(_ndi_libdir_fallback "${_cand}")
+                endif()
+                get_filename_component(_cand_name "${_cand}" NAME)
+                if(_cand_name MATCHES "${CMAKE_SYSTEM_PROCESSOR}")
+                    set(_ndi_libdir "${_cand}")
+                    break()
+                endif()
+            endif()
+        endforeach()
+        if(_ndi_libdir STREQUAL "")
+            # Nessuna sottocartella corrisponde all'host: se ce n'e' una sola in assoluto usiamo
+            # comunque quella (caso comune, nessuna ambiguita' possibile), altrimenti falliamo
+            # con un messaggio chiaro invece di indovinare.
+            list(LENGTH _ndi_lib_candidates _n_candidates)
+            if(_n_candidates EQUAL 1)
+                set(_ndi_libdir "${_ndi_libdir_fallback}")
+            else()
+                message(FATAL_ERROR
+                    "SDK multi-architettura: nessuna sottocartella lib/ corrisponde "
+                    "all'host (${CMAKE_SYSTEM_PROCESSOR}). Trovate: ${_ndi_lib_candidates}. "
+                    "Imposta -DNDI_SDK_LIBDIR=... per sceglierne una esplicitamente.")
+            endif()
+        endif()
+    endif()
+    message(STATUS "NDI Advanced SDK: include=${NDI_SDK_DIR}/include lib=${_ndi_libdir}")
+
+    foreach(_target ndi_hx_send ndi_hx_inspect)
+        if(_target STREQUAL "ndi_hx_send")
+            add_executable(${_target} ${_target}.cpp)
+            target_link_libraries(${_target} PRIVATE annexb)
+        else()
+            add_executable(${_target} ${_target}.cpp)
+        endif()
+        target_include_directories(${_target} PRIVATE "${NDI_SDK_DIR}/include")
+        target_link_directories(${_target} PRIVATE "${_ndi_libdir}")
+        target_link_libraries(${_target} PRIVATE ndi_advanced dl pthread)
+        set_target_properties(${_target} PROPERTIES
+            INSTALL_RPATH "${_ndi_libdir}"
+            BUILD_WITH_INSTALL_RPATH TRUE)
+    endforeach()
+
+    install(TARGETS ndi_hx_send ndi_hx_inspect RUNTIME DESTINATION bin)
+else()
+    message(STATUS "NDI_SDK_DIR non impostato: verranno costruiti solo il modulo annexb e i "
+                    "test. Passa -DNDI_SDK_DIR=/path/to/ndi-adv-sdk anche per ndi_hx_send/"
+                    "ndi_hx_inspect.")
+endif()
+
+install(PROGRAMS capture_cam_hx.sh DESTINATION bin)
+install(FILES ndi-webcam-send.service DESTINATION share/rodecaster-ndi-hx)
 
 ---
 
@@ -466,9 +673,13 @@ echo "Build OK -> ./ndi_hx_inspect (linkato contro $LIBDIR)"
 // data is as specified in Annex B... and the data must include the start codes", sia per il
 // campo dati che per extra_data (SPS/PPS). Questo modulo lavora sempre in Annex-B.
 //
-// Limite noto: un NAL di tipo slice (1 o 5) e' trattato come una access unit completa -- nessun
-// supporto per frame composti da piu' slice. Va bene con l'encoder hardware del Pi4
-// (h264_v4l2m2m, che non fa slicing) ma non e' un'assunzione valida per qualunque encoder H.264.
+// Access unit multi-slice (code review: Codex, fase 3 - "gestire access unit multi-slice"):
+// FrameAssembler riconosce l'inizio di un nuovo access unit tramite un Access Unit Delimiter
+// (NAL tipo 9), quando presente, oppure — quando assente, come nell'output dell'encoder
+// hardware del Pi4 — leggendo first_mb_in_slice dall'inizio dello slice header di ogni NAL
+// slice (7.4.1.2.4 della spec H.264: un nuovo access unit inizia quando first_mb_in_slice
+// torna a 0). Questo introduce una latenza di un access unit: un frame viene restituito solo
+// quando arriva la prima slice del frame successivo, o a fine flusso via flush().
 
 #include <cstddef>
 #include <cstdint>
@@ -512,34 +723,85 @@ void append_annexb(std::vector<uint8_t>* out, const std::vector<uint8_t>& nal);
 // del frame e il frame rate fps_n/fps_d. fps_n deve essere > 0.
 int64_t compute_hns(uint64_t frame_index, int fps_n, int fps_d);
 
-// Un frame Annex-B pronto per essere impacchettato in un pacchetto NDI compresso.
+// --- Parsing minimale dello slice header (solo first_mb_in_slice) ---------------------------
+//
+// Legge bit dal payload RBSP di un NAL rimuovendo al volo i byte di emulation-prevention
+// (0x03 dopo due 0x00 raw consecutivi, H.264 Annex B / 7.3.1). Non e' un parser RBSP completo:
+// serve solo a leggere i primi campi dello slice header.
+class RbspBitReader {
+public:
+    RbspBitReader(const uint8_t* data, size_t size) : data_(data), size_(size) {}
+
+    // Legge n bit (1 <= n <= 32) come intero big-endian. False se i dati finiscono prima.
+    bool read_bits(int n, uint32_t* out);
+
+    // Legge un valore Exp-Golomb senza segno ue(v): conta gli zero iniziali, poi legge
+    // altrettanti bit + 1 come mantissa (Tabella 9-2 della spec H.264).
+    bool read_ue(uint32_t* out);
+
+private:
+    bool read_bit(bool* out);
+    bool is_emulation_prevention_byte() const;
+
+    const uint8_t* data_;
+    size_t size_;
+    size_t byte_pos_ = 0;
+    int bit_pos_ = 0;
+};
+
+// Estrae first_mb_in_slice (il primissimo campo di slice_header(), H.264 7.3.3) da un NAL di
+// tipo 1 o 5. Ritorna false se il NAL e' troppo corto/corrotto per contenere un valore
+// leggibile -- in tal caso il chiamante deve trattare il NAL con prudenza (FrameAssembler lo
+// considera come inizio di un nuovo access unit, per non rischiare di accumulare dati corrotti
+// all'infinito in un buffer che non verrebbe mai emesso).
+bool parse_first_mb_in_slice(const std::vector<uint8_t>& nal, uint32_t* out);
+
+// Un frame Annex-B pronto per essere impacchettato in un pacchetto NDI compresso. Puo'
+// contenere piu' di un NAL slice (Annex-B concatenati) se l'access unit era multi-slice.
 struct AssembledFrame {
     bool is_keyframe = false;
     int64_t pts_hns = 0;
     int64_t dts_hns = 0;
-    std::vector<uint8_t> data;       // Annex-B: la slice di questo frame
+    std::vector<uint8_t> data;       // Annex-B: tutte le slice di questo access unit
     std::vector<uint8_t> extra_data; // Annex-B: SPS+PPS correnti, presente solo sui keyframe
 };
 
 // Accumula NAL "nudi" (senza start code, come restituiti da NalReader) e ricostruisce le
-// access unit. Un NAL SPS (7) o PPS (8) aggiorna i parametri correnti (extra_data viene
-// ricostruito ogni volta che sia SPS che PPS sono noti, quindi anche su SPS/PPS ripetuti). Un
-// NAL slice (tipo 1 o 5) chiude e restituisce un frame. Un IDR (tipo 5) e' marcato keyframe
-// solo se SPS+PPS sono gia' noti a quel punto (altrimenti verrebbe generato un keyframe senza
-// i parametri necessari a decodificarlo). NAL di altro tipo (AUD, SEI, filler...) sono ignorati.
+// access unit, incluse quelle composte da piu' slice. Un NAL SPS (7) o PPS (8) aggiorna i
+// parametri correnti (extra_data viene ricostruito ogni volta che sia SPS che PPS sono noti,
+// quindi anche su SPS/PPS ripetuti). Un Access Unit Delimiter (9), quando presente, forza
+// l'inizio di un nuovo access unit alla prossima slice; in sua assenza si usa
+// first_mb_in_slice. Un IDR (tipo 5) e' marcato keyframe solo se SPS+PPS sono gia' noti quando
+// l'access unit viene aperto.
+//
+// A causa della latenza di un access unit (vedi sopra), l'ultimo frame del flusso non viene
+// mai restituito da feed_nal(): va recuperato esplicitamente con flush() a fine stream.
 class FrameAssembler {
 public:
-    // Se il NAL fornito completa un frame, lo scrive in *out e ritorna true.
+    // Se il NAL fornito completa un access unit precedente, lo scrive in *out e ritorna true.
     bool feed_nal(const std::vector<uint8_t>& nal, int fps_n, int fps_d, AssembledFrame* out);
+
+    // Da chiamare a fine stream: se c'e' un access unit ancora in accumulo (non ancora chiuso
+    // perche' non e' arrivata la prima slice di quello successivo), lo restituisce.
+    bool flush(int fps_n, int fps_d, AssembledFrame* out);
 
     uint64_t frames_emitted() const { return frame_index_; }
 
 private:
     std::vector<uint8_t> sps_nal_, pps_nal_;
     std::vector<uint8_t> extradata_; // SPS+PPS in Annex-B, ricostruito ad ogni coppia completa
-    std::vector<uint8_t> au_;
+
+    std::vector<uint8_t> au_;          // access unit in accumulo (puo' contenere piu' slice)
+    bool au_pending_ = false;          // au_ contiene almeno una slice non ancora emessa
+    bool au_is_keyframe_ = false;      // vero se la prima slice dell'AU era un IDR con SPS/PPS noti
+    std::vector<uint8_t> au_extradata_; // extradata "congelato" al momento dell'apertura dell'AU
+    bool aud_pending_ = false;         // e' appena arrivato un AUD: la prossima slice apre un nuovo AU
+
     uint64_t frame_index_ = 0;
     bool have_params_ = false;
+
+    void open_au(int nal_type);
+    bool close_au(int fps_n, int fps_d, AssembledFrame* out);
 };
 
 } // namespace annexb
@@ -553,6 +815,8 @@ private:
 #include "annexb.h"
 
 namespace annexb {
+
+// --- NalReader --------------------------------------------------------------------------------
 
 size_t NalReader::find_start_code(const std::vector<uint8_t>& b, size_t from, size_t* len) {
     if (b.size() < 3) return npos;
@@ -604,6 +868,82 @@ int64_t compute_hns(uint64_t frame_index, int fps_n, int fps_d) {
     return (int64_t)((double)frame_index * 10000000.0 * fps_d / fps_n);
 }
 
+// --- RbspBitReader ------------------------------------------------------------------------
+
+bool RbspBitReader::is_emulation_prevention_byte() const {
+    // 00 00 03 e' sempre uno stuffing byte inserito dall'encoder per evitare che "00 00 00",
+    // "00 00 01", "00 00 02" o "00 00 03" appaiano nel NAL (verrebbero confusi con uno start
+    // code). Il controllo va fatto sui byte RAW del NAL, non su quelli gia' de-escapati:
+    // e' cosi' che un encoder decide dove inserirlo, quindi e' cosi' che va rimosso.
+    return byte_pos_ >= 2 && data_[byte_pos_] == 0x03 &&
+           data_[byte_pos_ - 1] == 0x00 && data_[byte_pos_ - 2] == 0x00;
+}
+
+bool RbspBitReader::read_bit(bool* out) {
+    while (byte_pos_ < size_ && bit_pos_ == 0 && is_emulation_prevention_byte()) {
+        byte_pos_++; // salta lo 0x03 di emulation prevention
+    }
+    if (byte_pos_ >= size_) return false;
+    *out = ((data_[byte_pos_] >> (7 - bit_pos_)) & 1) != 0;
+    bit_pos_++;
+    if (bit_pos_ == 8) { bit_pos_ = 0; byte_pos_++; }
+    return true;
+}
+
+bool RbspBitReader::read_bits(int n, uint32_t* out) {
+    uint32_t v = 0;
+    for (int i = 0; i < n; i++) {
+        bool b;
+        if (!read_bit(&b)) return false;
+        v = (v << 1) | (b ? 1u : 0u);
+    }
+    *out = v;
+    return true;
+}
+
+bool RbspBitReader::read_ue(uint32_t* out) {
+    int zeros = 0;
+    bool b;
+    for (;;) {
+        if (!read_bit(&b)) return false;
+        if (b) break;
+        zeros++;
+        if (zeros > 31) return false; // valore assurdo per un ue(v) reale: NAL corrotto
+    }
+    if (zeros == 0) { *out = 0; return true; }
+    uint32_t suffix;
+    if (!read_bits(zeros, &suffix)) return false;
+    *out = ((1u << zeros) - 1) + suffix;
+    return true;
+}
+
+bool parse_first_mb_in_slice(const std::vector<uint8_t>& nal, uint32_t* out) {
+    if (nal.size() < 2) return false; // serve almeno l'header NAL + un bit di slice_header
+    RbspBitReader r(nal.data() + 1, nal.size() - 1); // salta l'header NAL (1 byte)
+    return r.read_ue(out);
+}
+
+// --- FrameAssembler -----------------------------------------------------------------------
+
+void FrameAssembler::open_au(int nal_type) {
+    au_.clear();
+    au_is_keyframe_ = (nal_type == 5) && have_params_;
+    au_extradata_ = au_is_keyframe_ ? extradata_ : std::vector<uint8_t>{};
+    au_pending_ = true;
+}
+
+bool FrameAssembler::close_au(int fps_n, int fps_d, AssembledFrame* out) {
+    if (!au_pending_) return false;
+    out->is_keyframe = au_is_keyframe_;
+    out->pts_hns = out->dts_hns = compute_hns(frame_index_, fps_n, fps_d);
+    out->data = au_;
+    out->extra_data = au_extradata_;
+    frame_index_++;
+    au_pending_ = false;
+    au_.clear();
+    return true;
+}
+
 bool FrameAssembler::feed_nal(const std::vector<uint8_t>& nal, int fps_n, int fps_d, AssembledFrame* out) {
     if (nal.empty()) return false;
     const int nal_type = nal[0] & 0x1f;
@@ -620,26 +960,42 @@ bool FrameAssembler::feed_nal(const std::vector<uint8_t>& nal, int fps_n, int fp
         }
         return false;
     }
-    if (nal_type == 9 || nal_type == 6) {
-        return false; // AUD / SEI: non servono nel payload NDI
+    if (nal_type == 9) {
+        // Access Unit Delimiter: se presente, e' il modo piu' economico e affidabile per
+        // sapere che la prossima slice apre un nuovo access unit (non serve leggerne lo
+        // slice header). Se lo stream non usa AUD questo ramo semplicemente non scatta mai e
+        // si ricade sul parsing di first_mb_in_slice piu' sotto.
+        aud_pending_ = true;
+        return false;
+    }
+    if (nal_type == 6) {
+        return false; // SEI: non serve nel payload NDI
     }
     if (nal_type == 1 || nal_type == 5) {
-        // Slice (non-IDR / IDR): un frame per slice, dato che l'encoder non fa slicing (vedi
-        // limite noto in annexb.h). Un IDR e' un vero keyframe solo se SPS+PPS sono gia' noti.
-        const bool is_keyframe = (nal_type == 5) && have_params_;
-        au_.clear();
+        uint32_t first_mb = 0;
+        const bool parsed = parse_first_mb_in_slice(nal, &first_mb);
+        // Se il parsing fallisce trattiamo prudentemente il NAL come inizio di un nuovo
+        // access unit: meglio spezzare un frame in due che accumulare all'infinito dati
+        // potenzialmente corrotti in un buffer che potrebbe non essere mai chiuso.
+        const bool starts_new_au = aud_pending_ || !parsed || first_mb == 0;
+        aud_pending_ = false;
+
+        bool emitted = false;
+        if (starts_new_au && au_pending_) {
+            emitted = close_au(fps_n, fps_d, out);
+        }
+        if (starts_new_au || !au_pending_) {
+            open_au(nal_type);
+        }
         append_annexb(&au_, nal);
-
-        out->is_keyframe = is_keyframe;
-        out->pts_hns = out->dts_hns = compute_hns(frame_index_, fps_n, fps_d);
-        out->data = au_;
-        out->extra_data = is_keyframe ? extradata_ : std::vector<uint8_t>{};
-
-        frame_index_++;
-        return true;
+        return emitted;
     }
     // Altri tipi (filler, ecc.): ignorati.
     return false;
+}
+
+bool FrameAssembler::flush(int fps_n, int fps_d, AssembledFrame* out) {
+    return close_au(fps_n, fps_d, out);
 }
 
 } // namespace annexb
@@ -680,9 +1036,11 @@ bool FrameAssembler::feed_nal(const std::vector<uint8_t>& nal, int fps_n, int fp
 //   piu' basso". Per il flusso principale a risoluzione piena va sempre usato
 //   "highest_bandwidth", qualunque sia la risoluzione reale inviata.
 //
-// Limite noto: un NAL di tipo slice (1 o 5) e' trattato come un frame completo — nessun
-// supporto per access unit composte da piu' slice. Va bene con l'encoder hardware del Pi4
-// (h264_v4l2m2m, che non fa slicing) ma non e' un'assunzione valida per qualunque encoder.
+// Access unit multi-slice: annexb::FrameAssembler le ricompone correttamente (vedi annexb.h),
+// riconoscendo l'inizio di un nuovo frame via Access Unit Delimiter (quando presente) o
+// leggendo first_mb_in_slice dallo slice header. Questo introduce una latenza di un access
+// unit: un frame e' inviato solo quando arriva la prima slice di quello successivo, o a fine
+// stream (vedi il doppio flush prima della fine di main()).
 //
 // Variabile d'ambiente NDI_HX_DEBUG: se definita (a qualunque valore), scrive in
 // /tmp/hx_debug_* i byte grezzi del primo keyframe per ispezione con ffprobe/hexdump.
@@ -852,7 +1210,16 @@ int main(int argc, char* argv[])
             break; // EOF (n==0) o errore di lettura su stdin (ffmpeg terminato)
         }
     }
-    if (reader.flush(&nal) && assembler.feed_nal(nal, fps_n, fps_d, &af)) send_frame(af);
+    // Due livelli di flush a EOF (code review: Codex, fase 3): reader.flush() recupera l'ultimo
+    // NAL del flusso (che next_nal() non puo' mai restituire da solo, vedi NalReader). Dandolo
+    // in pasto all'assembler puo' chiudere l'access unit PRECEDENTE (se quell'ultimo NAL apre
+    // un nuovo AU), ma l'ultimo access unit del flusso resta comunque in sospeso finche' non si
+    // chiama esplicitamente assembler.flush() (vedi FrameAssembler: un AU si chiude solo
+    // quando arriva la prima slice di quello dopo, o a fine stream).
+    if (reader.flush(&nal)) {
+        if (assembler.feed_nal(nal, fps_n, fps_d, &af)) send_frame(af);
+    }
+    if (assembler.flush(fps_n, fps_d, &af)) send_frame(af);
 
     fprintf(stderr, "Stream terminato. Inviati %llu frame.\n", (unsigned long long)frames_sent);
 
@@ -1051,6 +1418,19 @@ static void append_start_code(std::vector<uint8_t>* out, int len) {
     out->push_back(1);
 }
 
+// Costruisce un NAL slice minimale con un first_mb_in_slice specifico codificato come ue(v)
+// (Tabella 9-2 H.264). Copre solo i valori piccoli usati nei test.
+static std::vector<uint8_t> make_slice(int nal_type, uint32_t first_mb, uint8_t tail_byte = 0xAA) {
+    uint8_t ue_byte;
+    switch (first_mb) {
+        case 0: ue_byte = 0x80; break; // ue(v) "1"
+        case 1: ue_byte = 0x40; break; // ue(v) "010"
+        case 2: ue_byte = 0x60; break; // ue(v) "011"
+        default: ue_byte = 0x80; break;
+    }
+    return {(uint8_t)nal_type, ue_byte, tail_byte};
+}
+
 // ============================================================================================
 // NalReader
 // ============================================================================================
@@ -1140,30 +1520,90 @@ TEST(nalreader_no_start_code_never_returns_a_nal) {
 }
 
 // ============================================================================================
+// RbspBitReader / parse_first_mb_in_slice
+// ============================================================================================
+
+TEST(rbsp_bitreader_removes_emulation_prevention_bytes) {
+    // RBSP "vera" prima dell'escaping: AB 00 00 01 CD (contiene "00 00 01", che nei NAL H.264
+    // e' sempre preceduto da uno 0x03 di stuffing per non essere confuso con uno start code).
+    std::vector<uint8_t> encoded = {0xAB, 0x00, 0x00, 0x03, 0x01, 0xCD};
+    annexb::RbspBitReader r(encoded.data(), encoded.size());
+    uint32_t v;
+    CHECK(r.read_bits(8, &v)); CHECK_EQ(v, 0xABu);
+    CHECK(r.read_bits(8, &v)); CHECK_EQ(v, 0x00u);
+    CHECK(r.read_bits(8, &v)); CHECK_EQ(v, 0x00u);
+    CHECK(r.read_bits(8, &v)); CHECK_EQ(v, 0x01u); // lo 0x03 e' stato rimosso automaticamente
+    CHECK(r.read_bits(8, &v)); CHECK_EQ(v, 0xCDu);
+    CHECK(!r.read_bits(8, &v)); // dati finiti
+}
+
+TEST(rbsp_bitreader_ue_golomb_table) {
+    // Tabella 9-2 H.264: 0->"1", 1->"010", 2->"011", 3->"00100", 4->"00101".
+    struct Case { std::vector<uint8_t> bytes; uint32_t expected; };
+    const Case cases[] = {
+        {{0x80}, 0},             // "1"
+        {{0x40}, 1},             // "010"
+        {{0x60}, 2},             // "011"
+        {{0x24, 0x00}, 3},       // "00100"
+        {{0x28, 0x00}, 4},       // "00101"
+    };
+    for (const auto& c : cases) {
+        annexb::RbspBitReader r(c.bytes.data(), c.bytes.size());
+        uint32_t v = 0xFFFFFFFFu;
+        CHECK(r.read_ue(&v));
+        CHECK_EQ(v, c.expected);
+    }
+}
+
+TEST(parse_first_mb_in_slice_common_values) {
+    uint32_t v;
+    CHECK(annexb::parse_first_mb_in_slice(make_slice(1, 0), &v));
+    CHECK_EQ(v, 0u);
+    CHECK(annexb::parse_first_mb_in_slice(make_slice(1, 1), &v));
+    CHECK_EQ(v, 1u);
+    CHECK(annexb::parse_first_mb_in_slice(make_slice(1, 2), &v));
+    CHECK_EQ(v, 2u);
+}
+
+TEST(parse_first_mb_in_slice_too_short_fails_gracefully) {
+    uint32_t v;
+    std::vector<uint8_t> too_short = {0x41}; // solo l'header NAL, nessun bit di slice_header
+    CHECK(!annexb::parse_first_mb_in_slice(too_short, &v));
+    std::vector<uint8_t> empty_nal;
+    CHECK(!annexb::parse_first_mb_in_slice(empty_nal, &v));
+}
+
+// ============================================================================================
 // FrameAssembler
 // ============================================================================================
 
 // Copre: "SPS e PPS ripetuti" — l'extradata non deve restare "stale" al giro successivo.
+// Nota sulla latenza: feed_nal() restituisce l'access unit PRECEDENTE quando ne inizia uno
+// nuovo (vedi annexb.h), quindi qui servono due IDR e un flush() finale per osservare entrambi
+// gli extradata.
 TEST(assembler_repeated_sps_pps_updates_extradata) {
     annexb::FrameAssembler a;
     annexb::AssembledFrame out;
 
     std::vector<uint8_t> sps1 = {0x07, 0x11, 0x22};
     std::vector<uint8_t> pps1 = {0x08, 0x33};
-    std::vector<uint8_t> idr  = {0x05, 0x99};
+    std::vector<uint8_t> idr1 = make_slice(5, 0);
 
     CHECK(!a.feed_nal(sps1, 30, 1, &out));
     CHECK(!a.feed_nal(pps1, 30, 1, &out));
-    CHECK(a.feed_nal(idr, 30, 1, &out));
-    CHECK(out.is_keyframe);
-    CHECK(!out.extra_data.empty());
-    std::vector<uint8_t> first_extradata = out.extra_data;
+    CHECK(!a.feed_nal(idr1, 30, 1, &out)); // apre il primo AU, niente ancora da emettere
 
     std::vector<uint8_t> sps2 = {0x07, 0x44, 0x55, 0x66}; // SPS "diverso" (piu' lungo)
     std::vector<uint8_t> pps2 = {0x08, 0x77};
+    std::vector<uint8_t> idr2 = make_slice(5, 0);
     CHECK(!a.feed_nal(sps2, 30, 1, &out));
     CHECK(!a.feed_nal(pps2, 30, 1, &out));
-    CHECK(a.feed_nal(idr, 30, 1, &out));
+    CHECK(a.feed_nal(idr2, 30, 1, &out)); // chiude e restituisce il primo AU (con extradata1)
+    CHECK(out.is_keyframe);
+    std::vector<uint8_t> first_extradata = out.extra_data;
+    CHECK(!first_extradata.empty());
+
+    CHECK(a.flush(30, 1, &out)); // restituisce il secondo AU (con extradata2)
     CHECK(out.is_keyframe);
     CHECK(!(out.extra_data == first_extradata));
 }
@@ -1172,17 +1612,15 @@ TEST(assembler_repeated_sps_pps_updates_extradata) {
 TEST(assembler_idr_without_params_is_not_a_keyframe) {
     annexb::FrameAssembler a;
     annexb::AssembledFrame out;
-    std::vector<uint8_t> idr = {0x05, 0x99};
-    CHECK(a.feed_nal(idr, 30, 1, &out));
-    CHECK(!out.is_keyframe);
+    CHECK(!a.feed_nal(make_slice(5, 0), 30, 1, &out)); // apre l'AU, niente da emettere ancora
+    CHECK(a.flush(30, 1, &out));
+    CHECK(!out.is_keyframe); // niente SPS/PPS ancora: non va marcato come keyframe
     CHECK(out.extra_data.empty());
 }
 
-// Copre: "frame con piu' slice". Limite noto (vedi annexb.h): l'assembler NON ricompone piu'
-// slice in un'unica access unit. Questo test fissa il comportamento ATTUALE, cosi' che un
-// eventuale supporto multi-slice futuro sia una scelta esplicita e non una regressione
-// silenziosa scoperta troppo tardi.
-TEST(assembler_multi_slice_known_limitation_emits_separate_frames) {
+// Copre: "frame con piu' slice", risolto in fase 3. Due slice con first_mb_in_slice 0 poi !=0
+// (quindi la seconda e' una continuazione) devono confluire in UN SOLO access unit.
+TEST(assembler_multi_slice_merged_into_one_access_unit) {
     annexb::FrameAssembler a;
     annexb::AssembledFrame out;
     std::vector<uint8_t> sps = {0x07, 0x11};
@@ -1190,20 +1628,63 @@ TEST(assembler_multi_slice_known_limitation_emits_separate_frames) {
     a.feed_nal(sps, 30, 1, &out);
     a.feed_nal(pps, 30, 1, &out);
 
-    std::vector<uint8_t> slice1 = {0x01, 0xAA}; // due slice dello stesso frame reale
-    std::vector<uint8_t> slice2 = {0x01, 0xBB};
-    CHECK(a.feed_nal(slice1, 30, 1, &out));
+    std::vector<uint8_t> f1_slice1 = make_slice(1, 0, 0xAA); // apre il frame 1
+    std::vector<uint8_t> f1_slice2 = make_slice(1, 1, 0xBB); // continuazione dello stesso frame
+    CHECK(!a.feed_nal(f1_slice1, 30, 1, &out));
+    CHECK(!a.feed_nal(f1_slice2, 30, 1, &out));
+    CHECK_EQ(a.frames_emitted(), (uint64_t)0); // ancora nulla emesso: il frame 1 e' ancora aperto
+
+    std::vector<uint8_t> f2_slice1 = make_slice(1, 0, 0xCC); // apre il frame 2, chiude il frame 1
+    CHECK(a.feed_nal(f2_slice1, 30, 1, &out));
     CHECK_EQ(a.frames_emitted(), (uint64_t)1);
-    CHECK(a.feed_nal(slice2, 30, 1, &out));
-    CHECK_EQ(a.frames_emitted(), (uint64_t)2); // atteso oggi: 2 frame invece di 1 solo
+    // Il frame 1 restituito deve contenere ENTRAMBE le slice (Annex-B: start code + NAL x2).
+    const size_t expected_min = f1_slice1.size() + f1_slice2.size() + 4 + 4;
+    CHECK(out.data.size() == expected_min);
+
+    CHECK(a.flush(30, 1, &out)); // il frame 2 (una sola slice) resta in sospeso fino a qui
+    CHECK_EQ(a.frames_emitted(), (uint64_t)2);
+    CHECK(out.data.size() == f2_slice1.size() + 4);
 }
 
-// Copre: "dati troncati o malformati" lato assembler (NAL vuoto).
+// Copre lo stesso scenario di sopra ma usando un Access Unit Delimiter invece di affidarsi a
+// first_mb_in_slice: un AUD deve forzare l'apertura di un nuovo AU alla slice successiva a
+// prescindere da cosa dice first_mb_in_slice.
+TEST(assembler_aud_forces_new_access_unit) {
+    annexb::FrameAssembler a;
+    annexb::AssembledFrame out;
+    std::vector<uint8_t> aud = {0x09, 0xF0}; // NAL tipo 9 = Access Unit Delimiter
+
+    CHECK(!a.feed_nal(make_slice(1, 0), 30, 1, &out)); // apre il frame 1
+    CHECK(!a.feed_nal(aud, 30, 1, &out));               // AUD: la prossima slice apre un nuovo AU
+    // first_mb_in_slice=1 normalmente significherebbe "continuazione", ma l'AUD vince comunque.
+    CHECK(a.feed_nal(make_slice(1, 1), 30, 1, &out));
+    CHECK_EQ(a.frames_emitted(), (uint64_t)1);
+}
+
+// Copre: "dati troncati o malformati" lato assembler — un NAL slice troppo corto per contenere
+// first_mb_in_slice viene trattato, per prudenza, come inizio di un nuovo access unit: chiude
+// (e restituisce) l'AU precedente invece di rischiare di fondervi dati corrotti.
+TEST(assembler_malformed_slice_closes_previous_au) {
+    annexb::FrameAssembler a;
+    annexb::AssembledFrame out;
+    CHECK(!a.feed_nal(make_slice(1, 0), 30, 1, &out)); // apre il frame 1 (valido)
+
+    std::vector<uint8_t> too_short = {0x01}; // solo l'header NAL: parse_first_mb_in_slice fallisce
+    CHECK(a.feed_nal(too_short, 30, 1, &out)); // chiude e restituisce il frame 1
+    CHECK_EQ(a.frames_emitted(), (uint64_t)1);
+}
+
 TEST(assembler_empty_nal_is_ignored_without_crashing) {
     annexb::FrameAssembler a;
     annexb::AssembledFrame out;
     std::vector<uint8_t> empty;
     CHECK(!a.feed_nal(empty, 30, 1, &out));
+}
+
+TEST(assembler_flush_with_nothing_pending_returns_false) {
+    annexb::FrameAssembler a;
+    annexb::AssembledFrame out;
+    CHECK(!a.flush(30, 1, &out));
 }
 
 // Copre: "sequenze molto grandi e possibili overflow" — un NAL di alcuni MB e molte migliaia
@@ -1218,18 +1699,23 @@ TEST(assembler_large_nal_and_long_sequence) {
 
     std::vector<uint8_t> big_slice;
     big_slice.push_back(0x01);
-    big_slice.resize(1 + 4 * 1024 * 1024, 0xEE);
-    CHECK(a.feed_nal(big_slice, 30, 1, &out));
-    CHECK_EQ(out.data.size(), big_slice.size() + 4 /* start code */);
+    big_slice.push_back(0x80); // first_mb_in_slice = 0 (apre l'AU)
+    big_slice.resize(2 + 4 * 1024 * 1024, 0xEE);
+    CHECK(!a.feed_nal(big_slice, 30, 1, &out)); // apre l'AU: niente ancora da emettere
 
-    std::vector<uint8_t> slice = {0x01, 0x00};
-    int64_t prev_pts = out.pts_hns;
+    std::vector<uint8_t> slice = make_slice(1, 0); // ogni chiamata apre (e quindi chiude la
+                                                     // precedente) un nuovo access unit da 1 slice
+    int64_t prev_pts = -1;
     for (int i = 0; i < 10000; i++) {
-        CHECK(a.feed_nal(slice, 30, 1, &out));
-        CHECK(out.pts_hns >= prev_pts);
-        prev_pts = out.pts_hns;
+        const bool got = a.feed_nal(slice, 30, 1, &out);
+        CHECK(got); // dalla seconda chiamata in poi (compresa quella che chiude big_slice) sempre vero
+        if (got) {
+            CHECK(out.pts_hns >= prev_pts);
+            prev_pts = out.pts_hns;
+        }
     }
-    // SPS/PPS non emettono frame: solo big_slice + i 10000 slice del loop contano.
+    CHECK(a.flush(30, 1, &out)); // l'ultimo AU della sequenza resta in sospeso finche' non si fa flush
+    // big_slice + i primi 9999 "slice" del loop chiusi via feed_nal, l'ultimo via flush: 1 + 10000.
     CHECK_EQ(a.frames_emitted(), (uint64_t)(1 + 10000));
 }
 
@@ -1316,7 +1802,8 @@ jobs:
           fi
       - name: Build con warning severi (-Werror)
         run: |
-          ${{ matrix.compiler }} -std=c++17 -O2 -Wall -Wextra -Wpedantic -Wconversion -Werror \
+          ${{ matrix.compiler }} -std=c++17 -O2 -Wall -Wextra -Wpedantic -Wconversion \
+            -Wsign-conversion -Werror \
             -o test_annexb tests/test_annexb.cpp annexb.cpp
       - name: Esegui i test
         run: ./test_annexb
@@ -1327,5 +1814,20 @@ jobs:
             -o test_annexb_sanitized tests/test_annexb.cpp annexb.cpp
       - name: Esegui i test sotto sanitizer
         run: ./test_annexb_sanitized
+
+  # Verifica il sistema di build CMake (code review: Codex, fase 3 - "unificare le build con
+  # CMake o Meson, aggiungere target build/test"). L'SDK NDI non e' scaricabile in CI, quindi
+  # qui si costruisce solo cio' che non ne dipende (modulo annexb + test via CTest) -- gli
+  # script bash restano il modo supportato per compilare ndi_hx_send/ndi_hx_inspect in CI.
+  cmake-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configura
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build --verbose
+      - name: Test (CTest)
+        run: ctest --test-dir build --output-on-failure
 ```
 
