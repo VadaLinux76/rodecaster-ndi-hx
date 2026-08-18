@@ -1,5 +1,8 @@
 # rodecaster-ndi-hx
 
+[![License: MIT](https://img.shields.io/github/license/VadaLinux76/rodecaster-ndi-hx)](LICENSE)
+[![CI](https://github.com/VadaLinux76/rodecaster-ndi-hx/actions/workflows/ci.yml/badge.svg)](https://github.com/VadaLinux76/rodecaster-ndi-hx/actions/workflows/ci.yml)
+
 Trasforma una webcam USB collegata a un Raspberry Pi 4 in una sorgente **NDI|HX** vera (non
 NDI standard/SpeedHQ), usando l'encoder H.264 hardware del Pi4. Nato per alimentare un
 [RØDECaster Video](https://rode.com/en-us/rodecaster/rodecaster-video), che accetta solo
@@ -111,11 +114,19 @@ sopravvissuti a lungo ai test locali.
 
 ## Limitazioni
 
+- **Il Pi4 viaggia stabilmente intorno al 95% di CPU** (misurato a 1920x1080@30) mentre lo
+  stream è attivo. Il colpevole non è l'encoder H.264 (quello è hardware): è il decode
+  software del MJPEG in ingresso dalla webcam più la conversione di colorspace fatte da
+  ffmpeg su CPU, che da sole occupano stabilmente 2+ core su 4. Su un Pi4 dedicato solo a
+  questo va bene, ma non aspettarti margine per fare altro sulla stessa macchina.
 - Il Pi4 non ha encoder HEVC hardware (solo decode) — quindi qui si fa NDI|HX2 (H.264), non
   HX3/HEVC. HX3 via software encoding sarebbe probabilmente troppo pesante per il Pi4 in
-  tempo reale.
+  tempo reale (si aggiungerebbe all'uso di CPU già alto del punto sopra).
 - Testato con una singola webcam USB MJPEG 1920x1080@30 e un RØDECaster Video. Altre
   combinazioni webcam/receiver potrebbero avere ulteriori sorprese — issue e PR benvenute.
+- La CI (badge sopra) valida solo gli script bash (`shellcheck`): l'SDK NDI Advanced non è
+  scaricabile automaticamente in CI (richiede registrazione manuale su ndi.video), quindi il
+  codice C++ non viene compilato automaticamente ad ogni push.
 
 ## Licenza
 
