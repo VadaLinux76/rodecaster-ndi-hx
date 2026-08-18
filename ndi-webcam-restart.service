@@ -1,0 +1,6 @@
+[Unit]
+Description=Riavvia ndi-webcam-send.service (workaround per il limite di 30 minuti dell'NDI Advanced SDK in modalita' "development")
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl restart ndi-webcam-send.service

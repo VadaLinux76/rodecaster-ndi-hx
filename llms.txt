@@ -43,6 +43,9 @@ qui da una ricerca su un errore simile.
   binari, discovery di rete) — solo controlli in lettura, non tocca mai la webcam in streaming
 - [ndi-webcam-send.service](ndi-webcam-send.service): unit systemd di esempio per farlo
   partire al boot
+- [ndi-webcam-restart.service](ndi-webcam-restart.service) / [ndi-webcam-restart.timer](ndi-webcam-restart.timer):
+  timer systemd di esempio per riavviare periodicamente il servizio, workaround per il limite
+  di 30 minuti dell'NDI Advanced SDK in modalità "development"
 
 ## Test
 

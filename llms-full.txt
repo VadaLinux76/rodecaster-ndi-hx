@@ -124,6 +124,21 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now ndi-webcam-send.service
 ```
 
+### Riavvio periodico (limite di 30 minuti dell'SDK "development")
+
+Se usi la versione liberamente scaricabile dell'NDI Advanced SDK (vedi Requisiti sopra), lo
+stream si autolimita a 30 minuti. `ndi-webcam-restart.service`/`.timer` sono un timer systemd
+di esempio che riavvia `ndi-webcam-send.service` ogni 20 minuti (comoda distanza di sicurezza
+sotto i 30), a costo di qualche secondo di interruzione visibile sul receiver ad ogni giro.
+Con una licenza commerciale (che rimuove il limite) non serve.
+
+```bash
+sudo cp ndi-webcam-restart.service ndi-webcam-restart.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now ndi-webcam-restart.timer
+systemctl list-timers ndi-webcam-restart.timer  # controlla quando scatterà il prossimo giro
+```
+
 ## `ndi_hx_inspect`: verificare cosa arriva davvero
 
 ```bash
@@ -353,6 +368,21 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now ndi-webcam-send.service
 ```
 
+### Periodic restart (the "development" SDK's 30-minute limit)
+
+If you're using the freely downloadable NDI Advanced SDK (see Requirements above), the stream
+self-limits to 30 minutes. `ndi-webcam-restart.service`/`.timer` are an example systemd timer
+that restarts `ndi-webcam-send.service` every 20 minutes (a comfortable safety margin under
+30), at the cost of a few seconds of visible interruption on the receiver each time. Not
+needed with a commercial license (which removes the limit).
+
+```bash
+sudo cp ndi-webcam-restart.service ndi-webcam-restart.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now ndi-webcam-restart.timer
+systemctl list-timers ndi-webcam-restart.timer  # check when the next cycle will fire
+```
+
 ## Self-diagnosis
 
 ```bash
@@ -521,6 +551,9 @@ qui da una ricerca su un errore simile.
   binari, discovery di rete) — solo controlli in lettura, non tocca mai la webcam in streaming
 - [ndi-webcam-send.service](ndi-webcam-send.service): unit systemd di esempio per farlo
   partire al boot
+- [ndi-webcam-restart.service](ndi-webcam-restart.service) / [ndi-webcam-restart.timer](ndi-webcam-restart.timer):
+  timer systemd di esempio per riavviare periodicamente il servizio, workaround per il limite
+  di 30 minuti dell'NDI Advanced SDK in modalità "development"
 
 ## Test
 
@@ -604,6 +637,36 @@ RestartSec=3
 
 [Install]
 WantedBy=multi-user.target
+```
+
+---
+
+## File: `ndi-webcam-restart.service`
+
+```ini
+[Unit]
+Description=Riavvia ndi-webcam-send.service (workaround per il limite di 30 minuti dell'NDI Advanced SDK in modalita' "development")
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl restart ndi-webcam-send.service
+```
+
+---
+
+## File: `ndi-webcam-restart.timer`
+
+```ini
+[Unit]
+Description=Ogni 20 minuti, riavvia ndi-webcam-send.service
+
+[Timer]
+OnBootSec=20min
+OnUnitActiveSec=20min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
 ```
 
 ---
