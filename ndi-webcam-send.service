@@ -1,0 +1,18 @@
+[Unit]
+Description=Cattura webcam USB e invio come sorgente NDI|HX (H.264 hardware)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Sostituisci <user> con il tuo utente
+User=<user>
+WorkingDirectory=/home/<user>/rodecaster-ndi-hx
+# Sostituisci il device con `v4l2-ctl --list-devices` o `ls /dev/v4l/by-id/` sulla tua webcam,
+# e adatta risoluzione/fps/nome sorgente NDI/bitrate/gop ai tuoi bisogni.
+ExecStart=/home/<user>/rodecaster-ndi-hx/capture_cam_hx.sh /dev/v4l/by-id/usb-<la-tua-webcam>-video-index0 1920 1080 30 "Pi4 Cam HX" 8M 2
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

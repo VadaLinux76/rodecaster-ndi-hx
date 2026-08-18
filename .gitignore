@@ -1,0 +1,12 @@
+# SDK NDI proprietario: non va committato, si scarica da ndi.video (vedi README)
+ndi-adv-sdk/
+ndi-sdk/
+
+# Binari compilati
+ndi_hx_send
+ndi_hx_inspect
+
+# Editor/OS
+*.o
+*.swp
+.DS_Store
