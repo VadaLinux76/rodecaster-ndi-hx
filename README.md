@@ -4,6 +4,7 @@
 [![CI](https://github.com/VadaLinux76/rodecaster-ndi-hx/actions/workflows/ci.yml/badge.svg)](https://github.com/VadaLinux76/rodecaster-ndi-hx/actions/workflows/ci.yml)
 
 🇮🇹 Idea e progetto italiani, nati dal debugging di una serata su un RØDECaster Video vero.
+Leggi questo README anche in [🇬🇧 English](README.en.md).
 
 Trasforma una webcam USB collegata a un Raspberry Pi 4 in una sorgente **NDI|HX** vera (non
 NDI standard/SpeedHQ), usando l'encoder H.264 hardware del Pi4. Nato per alimentare un
@@ -116,6 +117,16 @@ Si collega come receiver NDI in modalità `COMPRESSED` e stampa la struttura rea
 ricevuti (FourCC, keyframe, dimensioni, extra_data). Utile sia per debuggare il proprio sender
 sia per ispezionare come si comporta una sorgente HX certificata reale (es. l'app RODE Capture
 su smartphone) e confrontarla.
+
+## Autodiagnosi
+
+```bash
+./doctor.sh /dev/video0
+```
+
+Controlla tutti i prerequisiti (ffmpeg, encoder hardware, formati della webcam, SDK NDI,
+binari compilati, discovery di rete) e segnala cosa manca. Solo controlli in lettura: non
+tocca mai la webcam in streaming, quindi è sicuro da lanciare anche a servizio già attivo.
 
 ## I 6 bug non ovvi (la parte utile per chi arriva da una ricerca disperata)
 

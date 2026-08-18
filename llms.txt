@@ -15,6 +15,8 @@ qui da una ricerca su un errore simile.
 ## Documentazione
 
 - [README](README.md): overview, requisiti, build, uso, e i 6 bug non ovvi con le relative fix
+  (italiano, versione originale/più dettagliata)
+- [README.en](README.en.md): stessa cosa in inglese
 - [llms-full.txt](llms-full.txt): tutto il contenuto del repository (README + sorgenti +
   script + config) consolidato in un solo file, per chi vuole il contesto completo senza
   seguire i link qui sotto
@@ -37,6 +39,8 @@ qui da una ricerca su un errore simile.
   `-DNDI_SDK_DIR=...`
 - [capture_cam_hx.sh](capture_cam_hx.sh): pipeline completa webcam → ffmpeg (encoder hardware
   H.264, fps intero o frazionario tipo 30000/1001) → ndi_hx_send
+- [doctor.sh](doctor.sh): autodiagnosi (ffmpeg, encoder hardware, formati webcam, SDK NDI,
+  binari, discovery di rete) — solo controlli in lettura, non tocca mai la webcam in streaming
 - [ndi-webcam-send.service](ndi-webcam-send.service): unit systemd di esempio per farlo
   partire al boot
 
