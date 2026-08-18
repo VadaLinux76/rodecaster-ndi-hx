@@ -22,13 +22,21 @@ qui da una ricerca su un errore simile.
 
 ## Codice
 
-- [ndi_hx_send.cpp](ndi_hx_send.cpp): il sender — legge H.264 Annex-B da stdin e lo pubblica
-  come pacchetto NDI compresso (NDI|HX)
+- [annexb.h](annexb.h) / [annexb.cpp](annexb.cpp): parsing Annex-B e ricostruzione delle
+  access unit — **nessuna dipendenza dall'SDK NDI**, compilabile e testabile ovunque
+- [ndi_hx_send.cpp](ndi_hx_send.cpp): wrapper sottile — usa `annexb` per l'assemblaggio e
+  traduce ogni frame in un pacchetto NDI compresso (NDI|HX)
 - [ndi_hx_inspect.cpp](ndi_hx_inspect.cpp): tool diagnostico, si collega a una sorgente NDI in
   modalità COMPRESSED e stampa la struttura reale dei pacchetti ricevuti
-- [build_hx.sh](build_hx.sh): compila ndi_hx_send contro l'NDI Advanced SDK
+- [build_hx.sh](build_hx.sh): compila ndi_hx_send (+ annexb.cpp) contro l'NDI Advanced SDK
 - [build_inspect.sh](build_inspect.sh): compila ndi_hx_inspect
 - [capture_cam_hx.sh](capture_cam_hx.sh): pipeline completa webcam → ffmpeg (encoder hardware
   H.264) → ndi_hx_send
 - [ndi-webcam-send.service](ndi-webcam-send.service): unit systemd di esempio per farlo
   partire al boot
+
+## Test
+
+- [tests/test_annexb.cpp](tests/test_annexb.cpp): test unitari del modulo `annexb` (nessuna
+  dipendenza esterna, harness minimale incluso nel file), eseguiti in CI su GCC e Clang con
+  warning severi e sotto AddressSanitizer/UndefinedBehaviorSanitizer

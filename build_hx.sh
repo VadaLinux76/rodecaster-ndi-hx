@@ -29,7 +29,7 @@ g++ -std=c++17 -O2 -Wall \
     -I"$NDI_SDK/include" \
     -L"$LIBDIR" \
     -Wl,-rpath,"$(realpath "$LIBDIR")" \
-    -o ndi_hx_send ndi_hx_send.cpp \
+    -o ndi_hx_send ndi_hx_send.cpp annexb.cpp \
     -lndi_advanced -ldl -lpthread
 
 echo "Build OK -> ./ndi_hx_send (linkato contro $LIBDIR)"

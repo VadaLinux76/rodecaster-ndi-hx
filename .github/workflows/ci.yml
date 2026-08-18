@@ -17,3 +17,34 @@ jobs:
         with:
           scandir: '.'
           severity: warning
+
+  # Test del modulo annexb.h/.cpp (parsing Annex-B + ricostruzione access unit), estratto
+  # apposta da ndi_hx_send.cpp per non dipendere dall'SDK NDI proprietario, che qui in CI non
+  # e' scaricabile automaticamente (code review: Codex, fase 2 - "questa parte puo' essere
+  # compilata e testata senza SDK proprietario").
+  unit-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [g++, clang++]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Installa il compilatore
+        run: |
+          if [ "${{ matrix.compiler }}" = "clang++" ]; then
+            sudo apt-get update && sudo apt-get install -y clang
+          fi
+      - name: Build con warning severi (-Werror)
+        run: |
+          ${{ matrix.compiler }} -std=c++17 -O2 -Wall -Wextra -Wpedantic -Wconversion -Werror \
+            -o test_annexb tests/test_annexb.cpp annexb.cpp
+      - name: Esegui i test
+        run: ./test_annexb
+      - name: Build con AddressSanitizer + UndefinedBehaviorSanitizer
+        run: |
+          ${{ matrix.compiler }} -std=c++17 -O1 -g -fno-omit-frame-pointer \
+            -fsanitize=address,undefined \
+            -o test_annexb_sanitized tests/test_annexb.cpp annexb.cpp
+      - name: Esegui i test sotto sanitizer
+        run: ./test_annexb_sanitized

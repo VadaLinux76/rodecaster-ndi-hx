@@ -46,6 +46,25 @@ debugging, in modo che chi ci si scontra dopo non debba rifarla da zero.
 ./build_inspect.sh    # -> ndi_hx_inspect (tool diagnostico, opzionale)
 ```
 
+## Architettura del codice
+
+Il parsing dello stream Annex-B e la ricostruzione delle access unit vivono in
+`annexb.h`/`annexb.cpp`, un modulo **senza alcuna dipendenza dall'SDK NDI** — `ndi_hx_send.cpp`
+resta un wrapper sottile che lo usa e traduce ogni frame assemblato in un pacchetto
+`NDIlib_compressed_packet_t`. La separazione esiste apposta per rendere testabile in CI la
+parte più delicata (parsing/assemblaggio) senza aver bisogno dell'SDK proprietario, che qui non
+è scaricabile automaticamente.
+
+```bash
+# Test unitari del modulo annexb (nessuna dipendenza, gira ovunque con solo g++/clang++)
+g++ -std=c++17 -Wall -Wextra -Wpedantic -o test_annexb tests/test_annexb.cpp annexb.cpp
+./test_annexb
+
+# stessa cosa con AddressSanitizer + UndefinedBehaviorSanitizer (quello che gira in CI)
+g++ -std=c++17 -O1 -g -fsanitize=address,undefined -o test_annexb_san tests/test_annexb.cpp annexb.cpp
+./test_annexb_san
+```
+
 ## Uso
 
 ```bash
@@ -126,9 +145,12 @@ sopravvissuti a lungo ai test locali.
   tempo reale (si aggiungerebbe all'uso di CPU già alto del punto sopra).
 - Testato con una singola webcam USB MJPEG 1920x1080@30 e un RØDECaster Video. Altre
   combinazioni webcam/receiver potrebbero avere ulteriori sorprese — issue e PR benvenute.
-- La CI (badge sopra) valida solo gli script bash (`shellcheck`): l'SDK NDI Advanced non è
-  scaricabile automaticamente in CI (richiede registrazione manuale su ndi.video), quindi il
-  codice C++ non viene compilato automaticamente ad ogni push.
+- La CI (badge sopra) valida gli script bash (`shellcheck`) e il modulo `annexb.h`/`.cpp`
+  (build + test su GCC e Clang, con `-Wall -Wextra -Wpedantic -Wconversion -Werror` e sotto
+  AddressSanitizer/UndefinedBehaviorSanitizer). **Non** compila invece `ndi_hx_send.cpp` /
+  `ndi_hx_inspect.cpp` per intero: l'SDK NDI Advanced non è scaricabile automaticamente in CI
+  (richiede registrazione manuale su ndi.video), e sono proprio quei due file gli unici a
+  dipenderne — è anche il motivo per cui la logica delicata è stata estratta in `annexb`.
 - **`ndi_hx_send` assume un NAL slice = un frame completo** (nessun supporto per access unit
   composte da più slice). Funziona perché l'encoder hardware del Pi4 (`h264_v4l2m2m`) non fa
   slicing, ma non è un'assunzione valida per qualunque encoder H.264 in generale — se sostituisci

@@ -63,6 +63,25 @@ debugging, in modo che chi ci si scontra dopo non debba rifarla da zero.
 ./build_inspect.sh    # -> ndi_hx_inspect (tool diagnostico, opzionale)
 ```
 
+## Architettura del codice
+
+Il parsing dello stream Annex-B e la ricostruzione delle access unit vivono in
+`annexb.h`/`annexb.cpp`, un modulo **senza alcuna dipendenza dall'SDK NDI** — `ndi_hx_send.cpp`
+resta un wrapper sottile che lo usa e traduce ogni frame assemblato in un pacchetto
+`NDIlib_compressed_packet_t`. La separazione esiste apposta per rendere testabile in CI la
+parte più delicata (parsing/assemblaggio) senza aver bisogno dell'SDK proprietario, che qui non
+è scaricabile automaticamente.
+
+```bash
+# Test unitari del modulo annexb (nessuna dipendenza, gira ovunque con solo g++/clang++)
+g++ -std=c++17 -Wall -Wextra -Wpedantic -o test_annexb tests/test_annexb.cpp annexb.cpp
+./test_annexb
+
+# stessa cosa con AddressSanitizer + UndefinedBehaviorSanitizer (quello che gira in CI)
+g++ -std=c++17 -O1 -g -fsanitize=address,undefined -o test_annexb_san tests/test_annexb.cpp annexb.cpp
+./test_annexb_san
+```
+
 ## Uso
 
 ```bash
@@ -143,9 +162,12 @@ sopravvissuti a lungo ai test locali.
   tempo reale (si aggiungerebbe all'uso di CPU già alto del punto sopra).
 - Testato con una singola webcam USB MJPEG 1920x1080@30 e un RØDECaster Video. Altre
   combinazioni webcam/receiver potrebbero avere ulteriori sorprese — issue e PR benvenute.
-- La CI (badge sopra) valida solo gli script bash (`shellcheck`): l'SDK NDI Advanced non è
-  scaricabile automaticamente in CI (richiede registrazione manuale su ndi.video), quindi il
-  codice C++ non viene compilato automaticamente ad ogni push.
+- La CI (badge sopra) valida gli script bash (`shellcheck`) e il modulo `annexb.h`/`.cpp`
+  (build + test su GCC e Clang, con `-Wall -Wextra -Wpedantic -Wconversion -Werror` e sotto
+  AddressSanitizer/UndefinedBehaviorSanitizer). **Non** compila invece `ndi_hx_send.cpp` /
+  `ndi_hx_inspect.cpp` per intero: l'SDK NDI Advanced non è scaricabile automaticamente in CI
+  (richiede registrazione manuale su ndi.video), e sono proprio quei due file gli unici a
+  dipenderne — è anche il motivo per cui la logica delicata è stata estratta in `annexb`.
 - **`ndi_hx_send` assume un NAL slice = un frame completo** (nessun supporto per access unit
   composte da più slice). Funziona perché l'encoder hardware del Pi4 (`h264_v4l2m2m`) non fa
   slicing, ma non è un'assunzione valida per qualunque encoder H.264 in generale — se sostituisci
@@ -206,16 +228,24 @@ qui da una ricerca su un errore simile.
 
 ## Codice
 
-- [ndi_hx_send.cpp](ndi_hx_send.cpp): il sender — legge H.264 Annex-B da stdin e lo pubblica
-  come pacchetto NDI compresso (NDI|HX)
+- [annexb.h](annexb.h) / [annexb.cpp](annexb.cpp): parsing Annex-B e ricostruzione delle
+  access unit — **nessuna dipendenza dall'SDK NDI**, compilabile e testabile ovunque
+- [ndi_hx_send.cpp](ndi_hx_send.cpp): wrapper sottile — usa `annexb` per l'assemblaggio e
+  traduce ogni frame in un pacchetto NDI compresso (NDI|HX)
 - [ndi_hx_inspect.cpp](ndi_hx_inspect.cpp): tool diagnostico, si collega a una sorgente NDI in
   modalità COMPRESSED e stampa la struttura reale dei pacchetti ricevuti
-- [build_hx.sh](build_hx.sh): compila ndi_hx_send contro l'NDI Advanced SDK
+- [build_hx.sh](build_hx.sh): compila ndi_hx_send (+ annexb.cpp) contro l'NDI Advanced SDK
 - [build_inspect.sh](build_inspect.sh): compila ndi_hx_inspect
 - [capture_cam_hx.sh](capture_cam_hx.sh): pipeline completa webcam → ffmpeg (encoder hardware
   H.264) → ndi_hx_send
 - [ndi-webcam-send.service](ndi-webcam-send.service): unit systemd di esempio per farlo
   partire al boot
+
+## Test
+
+- [tests/test_annexb.cpp](tests/test_annexb.cpp): test unitari del modulo `annexb` (nessuna
+  dipendenza esterna, harness minimale incluso nel file), eseguiti in CI su GCC e Clang con
+  warning severi e sotto AddressSanitizer/UndefinedBehaviorSanitizer
 
 ---
 
@@ -377,7 +407,7 @@ g++ -std=c++17 -O2 -Wall \
     -I"$NDI_SDK/include" \
     -L"$LIBDIR" \
     -Wl,-rpath,"$(realpath "$LIBDIR")" \
-    -o ndi_hx_send ndi_hx_send.cpp \
+    -o ndi_hx_send ndi_hx_send.cpp annexb.cpp \
     -lndi_advanced -ldl -lpthread
 
 echo "Build OK -> ./ndi_hx_send (linkato contro $LIBDIR)"
@@ -421,6 +451,196 @@ echo "Build OK -> ./ndi_hx_inspect (linkato contro $LIBDIR)"
 
 ---
 
+## File: `annexb.h`
+
+```cpp
+#pragma once
+// Modulo puro C++ (nessuna dipendenza dall'SDK NDI, nessun I/O reale) per il parsing di uno
+// stream elementare H.264 Annex-B e la ricostruzione delle access unit da pubblicare come
+// NDI|HX. Estratto da ndi_hx_send.cpp per essere compilabile e testabile senza il proprietario
+// NDI Advanced SDK, che in CI non e' scaricabile automaticamente (code review: Codex, fase 2 -
+// "separare dal codice NDI: parser Annex-B, ricostruzione access unit, gestione SPS/PPS,
+// calcolo PTS/DTS, assemblaggio logico del pacchetto").
+//
+// Formato dati: la documentazione ufficiale NDI e' esplicita — "NDI assumes that all H.264
+// data is as specified in Annex B... and the data must include the start codes", sia per il
+// campo dati che per extra_data (SPS/PPS). Questo modulo lavora sempre in Annex-B.
+//
+// Limite noto: un NAL di tipo slice (1 o 5) e' trattato come una access unit completa -- nessun
+// supporto per frame composti da piu' slice. Va bene con l'encoder hardware del Pi4
+// (h264_v4l2m2m, che non fa slicing) ma non e' un'assunzione valida per qualunque encoder H.264.
+
+#include <cstddef>
+#include <cstdint>
+#include <vector>
+
+namespace annexb {
+
+// --- Estrazione dei NAL da un flusso Annex-B -------------------------------------------------
+//
+// Non fa I/O: il chiamante alimenta i byte via feed() (equivalente a un read() riuscito, in
+// qualunque dimensione di chunk) e poi chiama next_nal() finche' ritorna frame disponibili.
+class NalReader {
+public:
+    static constexpr size_t npos = (size_t)-1;
+
+    void feed(const uint8_t* data, size_t len) { buf_.insert(buf_.end(), data, data + len); }
+    void feed(const std::vector<uint8_t>& data) { feed(data.data(), data.size()); }
+
+    // Estrae il prossimo NAL completo (payload, senza start code) se ne e' disponibile uno
+    // interamente delimitato da due start code consecutivi (3 o 4 byte: 00 00 01 / 00 00 00 01).
+    // Consuma il buffer via erase.
+    bool next_nal(std::vector<uint8_t>* out);
+
+    // Da chiamare a EOF: un NAL delimitato da un solo start code (senza uno successivo, perche'
+    // i dati sono finiti) non puo' mai essere restituito da next_nal(). flush() lo recupera
+    // comunque, prendendo tutto cio' che segue l'ultimo start code fino alla fine del buffer.
+    bool flush(std::vector<uint8_t>* out);
+
+    bool empty() const { return buf_.empty(); }
+    size_t buffered_bytes() const { return buf_.size(); }
+
+private:
+    std::vector<uint8_t> buf_;
+    static size_t find_start_code(const std::vector<uint8_t>& b, size_t from, int* len);
+};
+
+// Annex-B: start code a 4 byte + NAL "nudo".
+void append_annexb(std::vector<uint8_t>* out, const std::vector<uint8_t>& nal);
+
+// PTS/DTS in unita' di 100ns (HNS, lo stesso schema usato da NDI), dato l'indice progressivo
+// del frame e il frame rate fps_n/fps_d. fps_n deve essere > 0.
+int64_t compute_hns(uint64_t frame_index, int fps_n, int fps_d);
+
+// Un frame Annex-B pronto per essere impacchettato in un pacchetto NDI compresso.
+struct AssembledFrame {
+    bool is_keyframe = false;
+    int64_t pts_hns = 0;
+    int64_t dts_hns = 0;
+    std::vector<uint8_t> data;       // Annex-B: la slice di questo frame
+    std::vector<uint8_t> extra_data; // Annex-B: SPS+PPS correnti, presente solo sui keyframe
+};
+
+// Accumula NAL "nudi" (senza start code, come restituiti da NalReader) e ricostruisce le
+// access unit. Un NAL SPS (7) o PPS (8) aggiorna i parametri correnti (extra_data viene
+// ricostruito ogni volta che sia SPS che PPS sono noti, quindi anche su SPS/PPS ripetuti). Un
+// NAL slice (tipo 1 o 5) chiude e restituisce un frame. Un IDR (tipo 5) e' marcato keyframe
+// solo se SPS+PPS sono gia' noti a quel punto (altrimenti verrebbe generato un keyframe senza
+// i parametri necessari a decodificarlo). NAL di altro tipo (AUD, SEI, filler...) sono ignorati.
+class FrameAssembler {
+public:
+    // Se il NAL fornito completa un frame, lo scrive in *out e ritorna true.
+    bool feed_nal(const std::vector<uint8_t>& nal, int fps_n, int fps_d, AssembledFrame* out);
+
+    uint64_t frames_emitted() const { return frame_index_; }
+
+private:
+    std::vector<uint8_t> sps_nal_, pps_nal_;
+    std::vector<uint8_t> extradata_; // SPS+PPS in Annex-B, ricostruito ad ogni coppia completa
+    std::vector<uint8_t> au_;
+    uint64_t frame_index_ = 0;
+    bool have_params_ = false;
+};
+
+} // namespace annexb
+```
+
+---
+
+## File: `annexb.cpp`
+
+```cpp
+#include "annexb.h"
+
+namespace annexb {
+
+size_t NalReader::find_start_code(const std::vector<uint8_t>& b, size_t from, int* len) {
+    if (b.size() < 3) return npos;
+    for (size_t i = from; i + 3 <= b.size(); i++) {
+        if (b[i] == 0 && b[i + 1] == 0 && b[i + 2] == 1) {
+            if (i > from && b[i - 1] == 0) { *len = 4; return i - 1; }
+            *len = 3;
+            return i;
+        }
+    }
+    return npos;
+}
+
+bool NalReader::next_nal(std::vector<uint8_t>* out) {
+    int len1 = 0;
+    size_t sc1 = find_start_code(buf_, 0, &len1);
+    if (sc1 == npos) return false;
+    int len2 = 0;
+    size_t sc2 = find_start_code(buf_, sc1 + len1, &len2);
+    if (sc2 == npos) return false; // NAL non ancora completo: aspetta altri dati
+
+    out->assign(buf_.begin() + sc1 + len1, buf_.begin() + sc2);
+    buf_.erase(buf_.begin(), buf_.begin() + sc2); // lascia lo start code successivo in testa
+    return true;
+}
+
+bool NalReader::flush(std::vector<uint8_t>* out) {
+    int len1 = 0;
+    size_t sc1 = find_start_code(buf_, 0, &len1);
+    if (sc1 == npos) return false;
+    out->assign(buf_.begin() + sc1 + len1, buf_.end());
+    buf_.clear();
+    return !out->empty();
+}
+
+void append_annexb(std::vector<uint8_t>* out, const std::vector<uint8_t>& nal) {
+    static const uint8_t sc[4] = {0, 0, 0, 1};
+    out->insert(out->end(), sc, sc + 4);
+    out->insert(out->end(), nal.begin(), nal.end());
+}
+
+int64_t compute_hns(uint64_t frame_index, int fps_n, int fps_d) {
+    return (int64_t)((double)frame_index * 10000000.0 * fps_d / fps_n);
+}
+
+bool FrameAssembler::feed_nal(const std::vector<uint8_t>& nal, int fps_n, int fps_d, AssembledFrame* out) {
+    if (nal.empty()) return false;
+    const int nal_type = nal[0] & 0x1f;
+
+    if (nal_type == 7 || nal_type == 8) {
+        // SPS (7) / PPS (8): tenute "nude" (senza start code) e riassemblate in Annex-B.
+        if (nal_type == 7) sps_nal_ = nal;
+        if (nal_type == 8) pps_nal_ = nal;
+        if (!sps_nal_.empty() && !pps_nal_.empty()) {
+            extradata_.clear();
+            append_annexb(&extradata_, sps_nal_);
+            append_annexb(&extradata_, pps_nal_);
+            have_params_ = true;
+        }
+        return false;
+    }
+    if (nal_type == 9 || nal_type == 6) {
+        return false; // AUD / SEI: non servono nel payload NDI
+    }
+    if (nal_type == 1 || nal_type == 5) {
+        // Slice (non-IDR / IDR): un frame per slice, dato che l'encoder non fa slicing (vedi
+        // limite noto in annexb.h). Un IDR e' un vero keyframe solo se SPS+PPS sono gia' noti.
+        const bool is_keyframe = (nal_type == 5) && have_params_;
+        au_.clear();
+        append_annexb(&au_, nal);
+
+        out->is_keyframe = is_keyframe;
+        out->pts_hns = out->dts_hns = compute_hns(frame_index_, fps_n, fps_d);
+        out->data = au_;
+        out->extra_data = is_keyframe ? extradata_ : std::vector<uint8_t>{};
+
+        frame_index_++;
+        return true;
+    }
+    // Altri tipi (filler, ecc.): ignorati.
+    return false;
+}
+
+} // namespace annexb
+```
+
+---
+
 ## File: `ndi_hx_send.cpp`
 
 ```cpp
@@ -429,6 +649,12 @@ echo "Build OK -> ./ndi_hx_inspect (linkato contro $LIBDIR)"
 // (NDIlib_FourCC_video_type_ex_H264_*), cioe' lo stesso meccanismo di trasporto usato da
 // NDI|HX. Richiede l'NDI Advanced SDK (necessario per i FourCC compressi e per la scrittura
 // diretta di pacchetti gia' codificati).
+//
+// La logica di parsing Annex-B/ricostruzione delle access unit vive in annexb.h/.cpp, che non
+// dipende dall'SDK NDI e ha una sua suite di test indipendente (vedi tests/) — questo file resta
+// un wrapper sottile: legge stdin, chiama nell'ordine annexb::NalReader/FrameAssembler, e
+// traduce ogni annexb::AssembledFrame in un pacchetto NDIlib_compressed_packet_t
+// (code review: Codex, fase 2 - "separare dal codice NDI").
 //
 // Formato dati: la documentazione ufficiale NDI e' esplicita — "NDI assumes that all H.264
 // data is as specified in Annex B... and the data must include the start codes", sia per il
@@ -466,82 +692,10 @@ echo "Build OK -> ./ndi_hx_inspect (linkato contro $LIBDIR)"
 #include <vector>
 #include <unistd.h>
 #include <Processing.NDI.Advanced.h>
+#include "annexb.h"
 
 static volatile sig_atomic_t g_stop = 0;
 static void on_signal(int) { g_stop = 1; }
-
-// --- Lettura incrementale da stdin con estrazione dei NAL Annex-B --------------------------
-
-struct NalReader {
-    std::vector<uint8_t> buf;
-    static const size_t CHUNK = 65536;
-
-    // Ritorna true se e' stato letto qualcosa (false = EOF).
-    bool fill() {
-        uint8_t tmp[CHUNK];
-        ssize_t n = read(STDIN_FILENO, tmp, sizeof(tmp));
-        if (n <= 0) {
-            if (n < 0 && errno == EINTR) return true; // riprova
-            return false;
-        }
-        buf.insert(buf.end(), tmp, tmp + n);
-        return true;
-    }
-
-    // Trova l'offset del prossimo start code (00 00 01 o 00 00 00 01) a partire da `from`.
-    // Ritorna la posizione di inizio del codice e la sua lunghezza (3 o 4), oppure npos.
-    static const size_t npos = (size_t)-1;
-
-    static size_t find_start_code(const std::vector<uint8_t>& b, size_t from, int* len) {
-        if (b.size() < 3) return npos;
-        for (size_t i = from; i + 3 <= b.size(); i++) {
-            if (b[i] == 0 && b[i + 1] == 0 && b[i + 2] == 1) {
-                if (i > from && b[i - 1] == 0) { *len = 4; return i - 1; }
-                *len = 3;
-                return i;
-            }
-        }
-        return npos;
-    }
-
-    // Estrae il prossimo NAL completo (payload, senza start code) se ne e' disponibile uno
-    // interamente delimitato da due start code consecutivi. Consuma il buffer via erase.
-    bool next_nal(std::vector<uint8_t>* out) {
-        int len1 = 0;
-        size_t sc1 = find_start_code(buf, 0, &len1);
-        if (sc1 == npos) return false;
-        int len2 = 0;
-        size_t sc2 = find_start_code(buf, sc1 + len1, &len2);
-        if (sc2 == npos) return false; // NAL non ancora completo: aspetta altri dati
-
-        out->assign(buf.begin() + sc1 + len1, buf.begin() + sc2);
-        buf.erase(buf.begin(), buf.begin() + sc2); // lascia lo start code successivo in testa
-        return true;
-    }
-
-    // Da chiamare a EOF (code review: Codex): next_nal() ritorna un NAL solo quando trova lo
-    // start code di quello successivo, quindi l'ultimo NAL dello stream — delimitato da un solo
-    // start code, senza uno dopo perche' i dati sono finiti — restava nel buffer e non veniva
-    // mai elaborato. Qui lo restituiamo comunque, prendendo tutto cio' che segue l'ultimo start
-    // code fino alla fine del buffer.
-    bool flush(std::vector<uint8_t>* out) {
-        int len1 = 0;
-        size_t sc1 = find_start_code(buf, 0, &len1);
-        if (sc1 == npos) return false;
-        out->assign(buf.begin() + sc1 + len1, buf.end());
-        buf.clear();
-        return !out->empty();
-    }
-};
-
-// Formato Annex-B: start code a 4 byte + NAL "nudo". Confermato dalla documentazione ufficiale
-// NDI: "NDI assumes that all H.264 data is as specified in Annex B... and the data must
-// include the start codes" - sia per i dati frame che per l'extra_data (SPS/PPS).
-static void append_annexb(std::vector<uint8_t>* out, const std::vector<uint8_t>& nal) {
-    static const uint8_t sc[4] = {0, 0, 0, 1};
-    out->insert(out->end(), sc, sc + 4);
-    out->insert(out->end(), nal.begin(), nal.end());
-}
 
 int main(int argc, char* argv[])
 {
@@ -603,27 +757,22 @@ int main(int argc, char* argv[])
     fprintf(stderr, "NDI HX source '%s' avviata: %dx%d @ %d/%d fps (H264 %s bandwidth)\n",
             ndi_name, width, height, fps_n, fps_d, lowest_bw ? "lowest" : "highest");
 
-    NalReader reader;
-    std::vector<uint8_t> nal;
-    std::vector<uint8_t> sps_nal, pps_nal;  // ultimi SPS/PPS "nudi" (senza start code)
-    std::vector<uint8_t> annexb_extradata;  // SPS+PPS in Annex-B (start code + NAL, concatenati)
-    std::vector<uint8_t> au;                // access unit corrente, formato Annex-B
-    uint64_t frame_index = 0;
-    uint64_t frames_sent = 0;
-    bool have_params = false;
-
     // Attiva lo scarico di file di debug in /tmp (vedi sotto) solo se richiesto esplicitamente:
     // prima veniva sempre scritto al primo keyframe, il che in produzione crea un effetto
     // collaterale non richiesto, puo' sovrascrivere diagnostica precedente ed espone porzioni
     // del flusso video ad altri processi locali su una macchina condivisa (code review: Codex).
     const bool debug_dump = getenv("NDI_HX_DEBUG") != nullptr;
 
-    auto emit_frame = [&](bool is_keyframe) {
-        if (au.empty()) return;
+    annexb::NalReader reader;
+    annexb::FrameAssembler assembler;
+    std::vector<uint8_t> nal;
+    uint64_t frames_sent = 0;
 
+    // Traduce un annexb::AssembledFrame in un pacchetto NDIlib_compressed_packet_t e lo invia.
+    // E' l'unico punto in cui questo file tocca l'SDK NDI per il payload video.
+    auto send_frame = [&](const annexb::AssembledFrame& af) {
         const size_t hdr_size = sizeof(NDIlib_compressed_packet_t);
-        const size_t extra_size = is_keyframe ? annexb_extradata.size() : 0;
-        const size_t total = hdr_size + au.size() + extra_size;
+        const size_t total = hdr_size + af.data.size() + af.extra_data.size();
 
         // Guardia overflow (code review: Codex): frame.data_size_in_bytes e' un int con segno,
         // quindi total non puo' eccedere INT_MAX senza troncare/wrap-around nel cast piu' sotto.
@@ -631,7 +780,6 @@ int main(int argc, char* argv[])
         // poter produrre un pacchetto NDI silenziosamente malformato.
         if (total > (size_t)INT_MAX) {
             fprintf(stderr, "[ndi_hx_send] frame scartato: %zu byte eccede INT_MAX.\n", total);
-            au.clear();
             return;
         }
 
@@ -639,17 +787,17 @@ int main(int argc, char* argv[])
         NDIlib_compressed_packet_t* hdr = (NDIlib_compressed_packet_t*)packet.data();
         hdr->version = NDIlib_compressed_packet_version_0;
         hdr->fourCC = NDIlib_compressed_FourCC_type_H264;
-        int64_t hns = (int64_t)((double)frame_index * 10000000.0 * fps_d / fps_n);
-        hdr->pts = hns;
-        hdr->dts = hns;
+        hdr->pts = af.pts_hns;
+        hdr->dts = af.dts_hns;
         hdr->reserved = 0;
-        hdr->flags = is_keyframe ? NDIlib_compressed_packet_flags_keyframe
-                                  : NDIlib_compressed_packet_flags_none;
-        hdr->data_size = (uint32_t)au.size();
-        hdr->extra_data_size = (uint32_t)extra_size;
+        hdr->flags = af.is_keyframe ? NDIlib_compressed_packet_flags_keyframe
+                                     : NDIlib_compressed_packet_flags_none;
+        hdr->data_size = (uint32_t)af.data.size();
+        hdr->extra_data_size = (uint32_t)af.extra_data.size();
 
-        memcpy(packet.data() + hdr_size, au.data(), au.size());
-        if (extra_size) memcpy(packet.data() + hdr_size + au.size(), annexb_extradata.data(), extra_size);
+        memcpy(packet.data() + hdr_size, af.data.data(), af.data.size());
+        if (!af.extra_data.empty())
+            memcpy(packet.data() + hdr_size + af.data.size(), af.extra_data.data(), af.extra_data.size());
 
         NDIlib_video_frame_v2_t frame{}; // zero-init, vedi nota sopra (code review: Codex)
         frame.xres = width;
@@ -659,77 +807,46 @@ int main(int argc, char* argv[])
         frame.frame_rate_D = fps_d;
         frame.picture_aspect_ratio = (float)width / (float)height; // 0 non va bene per stream compressi
         frame.frame_format_type = NDIlib_frame_format_type_progressive;
-        frame.timecode = hns; // deve essere il PTS reale, non il sentinel "synthesize"
+        frame.timecode = af.pts_hns; // deve essere il PTS reale, non il sentinel "synthesize"
         frame.p_data = packet.data();
         frame.data_size_in_bytes = (int)total;
         frame.p_metadata = NULL;
         frame.timestamp = 0;
 
-        if (debug_dump && is_keyframe && frames_sent == 0) {
-            // Debug una tantum (solo se NDI_HX_DEBUG e' impostata, vedi sopra): SPS/PPS "nudi"
-            // e il pacchetto NDI esatto del primo keyframe, per poterli ispezionare con
-            // ffprobe/hexdump fuori banda.
-            FILE* f1 = fopen("/tmp/hx_debug_sps_annexb.h264", "wb");
-            if (f1) {
-                static const uint8_t sc[4] = {0, 0, 0, 1};
-                fwrite(sc, 1, 4, f1); fwrite(sps_nal.data(), 1, sps_nal.size(), f1);
-                fwrite(sc, 1, 4, f1); fwrite(pps_nal.data(), 1, pps_nal.size(), f1);
-                fclose(f1);
-            }
-            FILE* f2 = fopen("/tmp/hx_debug_extradata.bin", "wb");
-            if (f2) { fwrite(annexb_extradata.data(), 1, annexb_extradata.size(), f2); fclose(f2); }
+        if (debug_dump && af.is_keyframe && frames_sent == 0) {
+            // Debug una tantum (solo se NDI_HX_DEBUG e' impostata, vedi sopra): il pacchetto
+            // NDI esatto del primo keyframe, per ispezionarlo con ffprobe/hexdump fuori banda.
             FILE* f3 = fopen("/tmp/hx_debug_ndi_packet.bin", "wb");
             if (f3) { fwrite(packet.data(), 1, packet.size(), f3); fclose(f3); }
-            fprintf(stderr, "[ndi_hx_send][debug] sps=%zuB pps=%zuB extradata=%zuB au=%zuB packet_tot=%zuB "
-                             "-> /tmp/hx_debug_*.bin\n",
-                    sps_nal.size(), pps_nal.size(), annexb_extradata.size(), au.size(), packet.size());
+            fprintf(stderr, "[ndi_hx_send][debug] data=%zuB extra=%zuB packet_tot=%zuB "
+                             "-> /tmp/hx_debug_ndi_packet.bin\n",
+                    af.data.size(), af.extra_data.size(), packet.size());
         }
 
         NDIlib_send_send_video_scatter(pNDI_send, &frame, NULL);
         frames_sent++;
-        frame_index++;
         if (frames_sent % (uint64_t)(fps_n * 10 / fps_d) == 0) { // ~ogni 10s
             fprintf(stderr, "[ndi_hx_send] %llu frame inviati, connessioni attive=%d\n",
                     (unsigned long long)frames_sent, NDIlib_send_get_no_connections(pNDI_send, 0));
         }
-        au.clear();
     };
 
-    // Dispatch per-NAL estratto in una lambda (code review: Codex) cosi' da poterlo riusare
-    // sia nel loop principale sia sull'ultimo NAL recuperato con reader.flush() a EOF.
-    auto process_nal = [&](const std::vector<uint8_t>& n) {
-        if (n.empty()) return;
-        const int nal_type = n[0] & 0x1f;
-
-        if (nal_type == 7 || nal_type == 8) {
-            // SPS (7) / PPS (8): tenute "nude" (senza start code) e riassemblate in Annex-B.
-            if (nal_type == 7) sps_nal = n;
-            if (nal_type == 8) pps_nal = n;
-            if (!sps_nal.empty() && !pps_nal.empty()) {
-                annexb_extradata.clear();
-                append_annexb(&annexb_extradata, sps_nal);
-                append_annexb(&annexb_extradata, pps_nal);
-                have_params = true;
-            }
-            return;
-        }
-        if (nal_type == 9 || nal_type == 6) {
-            return; // AUD / SEI: non servono nel payload NDI
-        }
-        if (nal_type == 1 || nal_type == 5) {
-            // Slice (non-IDR / IDR): un frame per slice, dato che l'encoder non fa slicing.
-            append_annexb(&au, n);
-            emit_frame(/*is_keyframe=*/nal_type == 5 && have_params);
-            return;
-        }
-        // Altri tipi (filler, ecc.): ignorati.
-    };
-
+    annexb::AssembledFrame af;
     while (!g_stop) {
-        while (reader.next_nal(&nal)) process_nal(nal);
-        if (!reader.fill()) break; // EOF su stdin (ffmpeg terminato)
+        while (reader.next_nal(&nal)) {
+            if (assembler.feed_nal(nal, fps_n, fps_d, &af)) send_frame(af);
+        }
+        uint8_t tmp[65536];
+        ssize_t n = read(STDIN_FILENO, tmp, sizeof(tmp));
+        if (n > 0) {
+            reader.feed(tmp, (size_t)n);
+        } else if (n < 0 && errno == EINTR) {
+            continue; // riprova
+        } else {
+            break; // EOF (n==0) o errore di lettura su stdin (ffmpeg terminato)
+        }
     }
-    if (reader.flush(&nal)) process_nal(nal); // ultimo NAL residuo, vedi NalReader::flush()
+    if (reader.flush(&nal) && assembler.feed_nal(nal, fps_n, fps_d, &af)) send_frame(af);
 
     fprintf(stderr, "Stream terminato. Inviati %llu frame.\n", (unsigned long long)frames_sent);
 
@@ -867,6 +984,290 @@ int main(int argc, char* argv[])
 
 ---
 
+## File: `tests/test_annexb.cpp`
+
+```cpp
+// Test unitari per annexb.h/.cpp — nessuna dipendenza esterna (ne' framework di test ne' SDK
+// NDI), cosi' da poter girare in CI senza il proprietario NDI Advanced SDK (code review:
+// Codex, fase 2 - "questa parte puo' essere compilata e testata senza SDK proprietario").
+//
+// Harness minimale: macro CHECK/CHECK_EQ + auto-registrazione delle TEST() via costruttori
+// statici. Vedi main() in fondo per l'esecuzione.
+
+#include "../annexb.h"
+
+#include <cstdint>
+#include <cstdio>
+#include <vector>
+
+static int g_checks = 0;
+static int g_failures = 0;
+
+#define CHECK(cond) do { \
+    g_checks++; \
+    if (!(cond)) { \
+        g_failures++; \
+        fprintf(stderr, "  FAIL %s:%d: CHECK(%s)\n", __FILE__, __LINE__, #cond); \
+    } \
+} while (0)
+
+#define CHECK_EQ(a, b) do { \
+    g_checks++; \
+    if (!((a) == (b))) { \
+        g_failures++; \
+        fprintf(stderr, "  FAIL %s:%d: CHECK_EQ(%s, %s)\n", __FILE__, __LINE__, #a, #b); \
+    } \
+} while (0)
+
+using TestFn = void (*)();
+struct TestCase { const char* name; TestFn fn; };
+
+static std::vector<TestCase>& registry() {
+    static std::vector<TestCase> r;
+    return r;
+}
+
+struct Registrar {
+    Registrar(const char* name, TestFn fn) { registry().push_back({name, fn}); }
+};
+
+#define TEST(name) \
+    static void test_##name(); \
+    static Registrar registrar_##name(#name, test_##name); \
+    static void test_##name()
+
+// --- helper --------------------------------------------------------------------------------
+
+static void append_start_code(std::vector<uint8_t>* out, int len) {
+    if (len == 4) out->push_back(0);
+    out->push_back(0);
+    out->push_back(0);
+    out->push_back(1);
+}
+
+// ============================================================================================
+// NalReader
+// ============================================================================================
+
+// Copre: "start code a tre e quattro byte" dalla checklist della code review.
+TEST(nalreader_3_and_4_byte_start_codes) {
+    annexb::NalReader r;
+    std::vector<uint8_t> stream;
+    append_start_code(&stream, 4);
+    stream.push_back(0x67); stream.push_back(0xAA); // NAL 1 (delimitato da start code a 4 byte)
+    append_start_code(&stream, 3);
+    stream.push_back(0x68); stream.push_back(0xBB); // NAL 2 (delimitato da start code a 3 byte)
+    append_start_code(&stream, 4);
+    stream.push_back(0x65); stream.push_back(0xCC); // NAL 3 (terminatore per chiudere NAL 2)
+    r.feed(stream);
+
+    std::vector<uint8_t> nal;
+    CHECK(r.next_nal(&nal));
+    CHECK_EQ(nal.size(), (size_t)2);
+    CHECK_EQ(nal[0], 0x67);
+
+    CHECK(r.next_nal(&nal));
+    CHECK_EQ(nal.size(), (size_t)2);
+    CHECK_EQ(nal[0], 0x68);
+
+    CHECK(!r.next_nal(&nal)); // NAL 3 non ancora chiuso da un quarto start code
+    CHECK(r.flush(&nal));
+    CHECK_EQ(nal[0], 0x65);
+}
+
+// Copre: "input diviso in chunk di dimensioni arbitrarie".
+TEST(nalreader_arbitrary_chunking_matches_single_feed) {
+    std::vector<uint8_t> stream;
+    append_start_code(&stream, 4);
+    for (uint8_t b : {(uint8_t)0x67, (uint8_t)0x01, (uint8_t)0x02, (uint8_t)0x03}) stream.push_back(b);
+    append_start_code(&stream, 4);
+    for (uint8_t b : {(uint8_t)0x65, (uint8_t)0x04, (uint8_t)0x05}) stream.push_back(b);
+    append_start_code(&stream, 4);
+    stream.push_back(0x01); // NAL finale minimale (recuperabile solo con flush())
+
+    annexb::NalReader ref;
+    ref.feed(stream);
+    std::vector<std::vector<uint8_t>> ref_nals;
+    std::vector<uint8_t> n;
+    while (ref.next_nal(&n)) ref_nals.push_back(n);
+    if (ref.flush(&n)) ref_nals.push_back(n);
+
+    // Stesso stream, alimentato un byte alla volta: il risultato deve essere identico
+    // indipendentemente da come i dati arrivano (simula read() che ritorna chunk arbitrari).
+    annexb::NalReader chunked;
+    std::vector<std::vector<uint8_t>> chunked_nals;
+    for (uint8_t b : stream) {
+        chunked.feed(&b, 1);
+        while (chunked.next_nal(&n)) chunked_nals.push_back(n);
+    }
+    if (chunked.flush(&n)) chunked_nals.push_back(n);
+
+    CHECK_EQ(ref_nals.size(), chunked_nals.size());
+    for (size_t i = 0; i < ref_nals.size() && i < chunked_nals.size(); i++)
+        CHECK(ref_nals[i] == chunked_nals[i]);
+}
+
+// Copre: "ultimo NAL a EOF" (il bug corretto in fase 1: prima andava perso).
+TEST(nalreader_flush_recovers_last_nal_at_eof) {
+    annexb::NalReader r;
+    std::vector<uint8_t> stream;
+    append_start_code(&stream, 4);
+    stream.push_back(0x67); stream.push_back(0xAA);
+    r.feed(stream);
+
+    std::vector<uint8_t> nal;
+    CHECK(!r.next_nal(&nal)); // nessun secondo start code: non ancora "completo"
+    CHECK(r.flush(&nal));
+    CHECK_EQ(nal.size(), (size_t)2);
+    CHECK_EQ(nal[0], 0x67);
+    CHECK(!r.flush(&nal)); // buffer ormai vuoto: flush ripetuto non deve inventarsi niente
+}
+
+// Copre: "dati troncati o malformati" (nessuno start code nel flusso).
+TEST(nalreader_no_start_code_never_returns_a_nal) {
+    annexb::NalReader r;
+    std::vector<uint8_t> garbage = {0x12, 0x34, 0x56, 0x78, 0x9A};
+    r.feed(garbage);
+    std::vector<uint8_t> nal;
+    CHECK(!r.next_nal(&nal));
+    CHECK(!r.flush(&nal));
+}
+
+// ============================================================================================
+// FrameAssembler
+// ============================================================================================
+
+// Copre: "SPS e PPS ripetuti" — l'extradata non deve restare "stale" al giro successivo.
+TEST(assembler_repeated_sps_pps_updates_extradata) {
+    annexb::FrameAssembler a;
+    annexb::AssembledFrame out;
+
+    std::vector<uint8_t> sps1 = {0x07, 0x11, 0x22};
+    std::vector<uint8_t> pps1 = {0x08, 0x33};
+    std::vector<uint8_t> idr  = {0x05, 0x99};
+
+    CHECK(!a.feed_nal(sps1, 30, 1, &out));
+    CHECK(!a.feed_nal(pps1, 30, 1, &out));
+    CHECK(a.feed_nal(idr, 30, 1, &out));
+    CHECK(out.is_keyframe);
+    CHECK(!out.extra_data.empty());
+    std::vector<uint8_t> first_extradata = out.extra_data;
+
+    std::vector<uint8_t> sps2 = {0x07, 0x44, 0x55, 0x66}; // SPS "diverso" (piu' lungo)
+    std::vector<uint8_t> pps2 = {0x08, 0x77};
+    CHECK(!a.feed_nal(sps2, 30, 1, &out));
+    CHECK(!a.feed_nal(pps2, 30, 1, &out));
+    CHECK(a.feed_nal(idr, 30, 1, &out));
+    CHECK(out.is_keyframe);
+    CHECK(!(out.extra_data == first_extradata));
+}
+
+// Copre: "IDR senza parametri disponibili" — non deve essere marcato come keyframe.
+TEST(assembler_idr_without_params_is_not_a_keyframe) {
+    annexb::FrameAssembler a;
+    annexb::AssembledFrame out;
+    std::vector<uint8_t> idr = {0x05, 0x99};
+    CHECK(a.feed_nal(idr, 30, 1, &out));
+    CHECK(!out.is_keyframe);
+    CHECK(out.extra_data.empty());
+}
+
+// Copre: "frame con piu' slice". Limite noto (vedi annexb.h): l'assembler NON ricompone piu'
+// slice in un'unica access unit. Questo test fissa il comportamento ATTUALE, cosi' che un
+// eventuale supporto multi-slice futuro sia una scelta esplicita e non una regressione
+// silenziosa scoperta troppo tardi.
+TEST(assembler_multi_slice_known_limitation_emits_separate_frames) {
+    annexb::FrameAssembler a;
+    annexb::AssembledFrame out;
+    std::vector<uint8_t> sps = {0x07, 0x11};
+    std::vector<uint8_t> pps = {0x08, 0x22};
+    a.feed_nal(sps, 30, 1, &out);
+    a.feed_nal(pps, 30, 1, &out);
+
+    std::vector<uint8_t> slice1 = {0x01, 0xAA}; // due slice dello stesso frame reale
+    std::vector<uint8_t> slice2 = {0x01, 0xBB};
+    CHECK(a.feed_nal(slice1, 30, 1, &out));
+    CHECK_EQ(a.frames_emitted(), (uint64_t)1);
+    CHECK(a.feed_nal(slice2, 30, 1, &out));
+    CHECK_EQ(a.frames_emitted(), (uint64_t)2); // atteso oggi: 2 frame invece di 1 solo
+}
+
+// Copre: "dati troncati o malformati" lato assembler (NAL vuoto).
+TEST(assembler_empty_nal_is_ignored_without_crashing) {
+    annexb::FrameAssembler a;
+    annexb::AssembledFrame out;
+    std::vector<uint8_t> empty;
+    CHECK(!a.feed_nal(empty, 30, 1, &out));
+}
+
+// Copre: "sequenze molto grandi e possibili overflow" — un NAL di alcuni MB e molte migliaia
+// di frame in sequenza, verificando che pts/frame_index avanzino in modo monotono e coerente.
+TEST(assembler_large_nal_and_long_sequence) {
+    annexb::FrameAssembler a;
+    annexb::AssembledFrame out;
+    std::vector<uint8_t> sps = {0x07, 0x11};
+    std::vector<uint8_t> pps = {0x08, 0x22};
+    a.feed_nal(sps, 30, 1, &out);
+    a.feed_nal(pps, 30, 1, &out);
+
+    std::vector<uint8_t> big_slice;
+    big_slice.push_back(0x01);
+    big_slice.resize(1 + 4 * 1024 * 1024, 0xEE);
+    CHECK(a.feed_nal(big_slice, 30, 1, &out));
+    CHECK_EQ(out.data.size(), big_slice.size() + 4 /* start code */);
+
+    std::vector<uint8_t> slice = {0x01, 0x00};
+    int64_t prev_pts = out.pts_hns;
+    for (int i = 0; i < 10000; i++) {
+        CHECK(a.feed_nal(slice, 30, 1, &out));
+        CHECK(out.pts_hns >= prev_pts);
+        prev_pts = out.pts_hns;
+    }
+    // SPS/PPS non emettono frame: solo big_slice + i 10000 slice del loop contano.
+    CHECK_EQ(a.frames_emitted(), (uint64_t)(1 + 10000));
+}
+
+// ============================================================================================
+// compute_hns
+// ============================================================================================
+
+// Copre: "frame rate frazionari, per esempio 30000/1001".
+TEST(compute_hns_fractional_frame_rate) {
+    int64_t hns0 = annexb::compute_hns(0, 30000, 1001);
+    int64_t hns1 = annexb::compute_hns(1, 30000, 1001);
+    CHECK_EQ(hns0, (int64_t)0);
+    // Atteso: 1001 * 10'000'000 / 30'000 ~= 333'666.67 hns
+    CHECK(hns1 > 333600 && hns1 < 333700);
+}
+
+TEST(compute_hns_integer_frame_rate) {
+    // A 30/1 fps un frame dura esattamente 10'000'000/30 = 333'333.33 hns.
+    CHECK_EQ(annexb::compute_hns(0, 30, 1), (int64_t)0);
+    CHECK_EQ(annexb::compute_hns(30, 30, 1), (int64_t)10000000); // 30 frame = esattamente 1s
+}
+
+// ============================================================================================
+
+int main() {
+    int failed_tests = 0;
+    for (const auto& tc : registry()) {
+        const int before = g_failures;
+        tc.fn();
+        if (g_failures > before) {
+            failed_tests++;
+            fprintf(stderr, "[FAIL] %s\n", tc.name);
+        } else {
+            fprintf(stderr, "[ OK ] %s\n", tc.name);
+        }
+    }
+    fprintf(stderr, "\n%d check(s), %d failure(s), %d/%zu test(s) failed\n",
+            g_checks, g_failures, failed_tests, registry().size());
+    return failed_tests == 0 ? 0 : 1;
+}
+```
+
+---
+
 ## File: `.github/workflows/ci.yml`
 
 ```yaml
@@ -889,5 +1290,36 @@ jobs:
         with:
           scandir: '.'
           severity: warning
+
+  # Test del modulo annexb.h/.cpp (parsing Annex-B + ricostruzione access unit), estratto
+  # apposta da ndi_hx_send.cpp per non dipendere dall'SDK NDI proprietario, che qui in CI non
+  # e' scaricabile automaticamente (code review: Codex, fase 2 - "questa parte puo' essere
+  # compilata e testata senza SDK proprietario").
+  unit-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [g++, clang++]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Installa il compilatore
+        run: |
+          if [ "${{ matrix.compiler }}" = "clang++" ]; then
+            sudo apt-get update && sudo apt-get install -y clang
+          fi
+      - name: Build con warning severi (-Werror)
+        run: |
+          ${{ matrix.compiler }} -std=c++17 -O2 -Wall -Wextra -Wpedantic -Wconversion -Werror \
+            -o test_annexb tests/test_annexb.cpp annexb.cpp
+      - name: Esegui i test
+        run: ./test_annexb
+      - name: Build con AddressSanitizer + UndefinedBehaviorSanitizer
+        run: |
+          ${{ matrix.compiler }} -std=c++17 -O1 -g -fno-omit-frame-pointer \
+            -fsanitize=address,undefined \
+            -o test_annexb_sanitized tests/test_annexb.cpp annexb.cpp
+      - name: Esegui i test sotto sanitizer
+        run: ./test_annexb_sanitized
 ```
 
