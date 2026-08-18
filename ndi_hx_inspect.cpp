@@ -3,6 +3,7 @@
 // confrontare un vero sender HX (es. RODE Capture su iPhone) con il nostro.
 #include <cstdio>
 #include <cstring>
+#include <cstdint>
 #include <chrono>
 #include <Processing.NDI.Advanced.h>
 
@@ -40,7 +41,7 @@ int main(int argc, char* argv[])
     if (!chosen) { fprintf(stderr, "Sorgente '%s' non trovata.\n", name_filter); return 1; }
     fprintf(stderr, "Connessione (COMPRESSED) a: %s\n", chosen->p_ndi_name);
 
-    NDIlib_recv_create_v3_t recv_desc;
+    NDIlib_recv_create_v3_t recv_desc{}; // zero-init (code review: Codex)
     recv_desc.source_to_connect_to = *chosen;
     recv_desc.color_format = (NDIlib_recv_color_format_e)NDIlib_recv_color_format_ex_compressed_v3;
     recv_desc.bandwidth = NDIlib_recv_bandwidth_highest;
@@ -69,15 +70,35 @@ int main(int argc, char* argv[])
                                || ((unsigned)vf.FourCC == (unsigned)NDIlib_FourCC_video_type_ex_H264_lowest_bandwidth)
                                || ((unsigned)vf.FourCC == (unsigned)NDIlib_FourCC_video_type_ex_HEVC_lowest_bandwidth);
 
-            if (is_compressed && vf.p_data) {
+            // Bound-check (code review: Codex): questo e' l'unico dei due programmi del
+            // progetto che indicizza un buffer riempito da un altro processo via rete. Prima
+            // leggevamo hdr->version/data_size/extra_data_size e li usavamo subito per calcolare
+            // puntatori, fidandoci ciecamente di quello che arrivava sul filo: un pacchetto
+            // corrotto o malevolo con questi campi fuori scala avrebbe causato una lettura fuori
+            // dai limiti del buffer. Ora si valida tutto contro vf.data_size_in_bytes (la
+            // dimensione reale del buffer, per un frame compresso) prima di toccarlo.
+            const int total = vf.data_size_in_bytes;
+            if (is_compressed && vf.p_data && total >= (int)sizeof(NDIlib_compressed_packet_t)) {
                 const NDIlib_compressed_packet_t* hdr = (const NDIlib_compressed_packet_t*)vf.p_data;
                 fprintf(stderr, "  packet.version=%d (sizeof=%zu) fourCC=0x%08x flags=%u data_size=%u extra_data_size=%u pts=%lld dts=%lld\n",
                         hdr->version, sizeof(NDIlib_compressed_packet_t), (unsigned)hdr->fourCC, hdr->flags,
                         hdr->data_size, hdr->extra_data_size, (long long)hdr->pts, (long long)hdr->dts);
-                const uint8_t* p_frame_data = (const uint8_t*)hdr + hdr->version;
-                const uint8_t* p_extra = p_frame_data + hdr->data_size;
-                hexdump(p_frame_data, hdr->data_size, "data (inizio)");
-                if (hdr->extra_data_size) hexdump(p_extra, hdr->extra_data_size, "extra_data (inizio)");
+
+                const bool bounds_ok =
+                    hdr->version >= (int32_t)sizeof(NDIlib_compressed_packet_t) &&
+                    hdr->version <= total &&
+                    (uint64_t)hdr->version + hdr->data_size <= (uint64_t)total &&
+                    (uint64_t)hdr->version + hdr->data_size + hdr->extra_data_size <= (uint64_t)total;
+
+                if (!bounds_ok) {
+                    fprintf(stderr, "  ATTENZIONE: data_size/extra_data_size fuori dai limiti del "
+                                     "buffer ricevuto (%d byte) -- pacchetto scartato.\n", total);
+                } else {
+                    const uint8_t* p_frame_data = (const uint8_t*)hdr + hdr->version;
+                    const uint8_t* p_extra = p_frame_data + hdr->data_size;
+                    hexdump(p_frame_data, (int)hdr->data_size, "data (inizio)");
+                    if (hdr->extra_data_size) hexdump(p_extra, (int)hdr->extra_data_size, "extra_data (inizio)");
+                }
             } else {
                 fprintf(stderr, "  (non compresso o p_data nullo -- FourCC non H264/HEVC)\n");
             }

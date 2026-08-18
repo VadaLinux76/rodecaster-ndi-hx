@@ -129,6 +129,21 @@ sopravvissuti a lungo ai test locali.
 - La CI (badge sopra) valida solo gli script bash (`shellcheck`): l'SDK NDI Advanced non è
   scaricabile automaticamente in CI (richiede registrazione manuale su ndi.video), quindi il
   codice C++ non viene compilato automaticamente ad ogni push.
+- **`ndi_hx_send` assume un NAL slice = un frame completo** (nessun supporto per access unit
+  composte da più slice). Funziona perché l'encoder hardware del Pi4 (`h264_v4l2m2m`) non fa
+  slicing, ma non è un'assunzione valida per qualunque encoder H.264 in generale — se sostituisci
+  la sorgente con un encoder che produce più slice per frame, il video arriverà spezzato.
+
+## Debug
+
+`ndi_hx_send` può scrivere in `/tmp/hx_debug_*` i byte grezzi del primo keyframe (SPS/PPS,
+extra_data, pacchetto NDI completo) per ispezionarli con `ffprobe`/`hexdump` fuori banda —
+utile se qualcosa non torna con un nuovo encoder/webcam. Disattivato di default: attivalo con
+la variabile d'ambiente `NDI_HX_DEBUG` (qualunque valore, basta che sia definita):
+
+```bash
+NDI_HX_DEBUG=1 ./capture_cam_hx.sh /dev/video0 1920 1080 30 "Pi4 Cam HX"
+```
 
 ## Licenza
 

@@ -21,12 +21,22 @@
 //   anteprima a risoluzione FISSA 640px di larghezza — non e' "lo stesso video a bitrate
 //   piu' basso". Per il flusso principale a risoluzione piena va sempre usato
 //   "highest_bandwidth", qualunque sia la risoluzione reale inviata.
+//
+// Limite noto: un NAL di tipo slice (1 o 5) e' trattato come un frame completo — nessun
+// supporto per access unit composte da piu' slice. Va bene con l'encoder hardware del Pi4
+// (h264_v4l2m2m, che non fa slicing) ma non e' un'assunzione valida per qualunque encoder.
+//
+// Variabile d'ambiente NDI_HX_DEBUG: se definita (a qualunque valore), scrive in
+// /tmp/hx_debug_* i byte grezzi del primo keyframe per ispezione con ffprobe/hexdump.
+// Disattivato di default: in produzione scrivere sempre in /tmp e' un effetto collaterale non
+// richiesto su una macchina potenzialmente condivisa (code review: Codex).
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <csignal>
 #include <cerrno>
+#include <climits>
 #include <vector>
 #include <unistd.h>
 #include <Processing.NDI.Advanced.h>
@@ -82,6 +92,20 @@ struct NalReader {
         buf.erase(buf.begin(), buf.begin() + sc2); // lascia lo start code successivo in testa
         return true;
     }
+
+    // Da chiamare a EOF (code review: Codex): next_nal() ritorna un NAL solo quando trova lo
+    // start code di quello successivo, quindi l'ultimo NAL dello stream — delimitato da un solo
+    // start code, senza uno dopo perche' i dati sono finiti — restava nel buffer e non veniva
+    // mai elaborato. Qui lo restituiamo comunque, prendendo tutto cio' che segue l'ultimo start
+    // code fino alla fine del buffer.
+    bool flush(std::vector<uint8_t>* out) {
+        int len1 = 0;
+        size_t sc1 = find_start_code(buf, 0, &len1);
+        if (sc1 == npos) return false;
+        out->assign(buf.begin() + sc1 + len1, buf.end());
+        buf.clear();
+        return !out->empty();
+    }
 };
 
 // Formato Annex-B: start code a 4 byte + NAL "nudo". Confermato dalla documentazione ufficiale
@@ -95,7 +119,11 @@ static void append_annexb(std::vector<uint8_t>* out, const std::vector<uint8_t>&
 
 int main(int argc, char* argv[])
 {
-    if (argc < 4) {
+    // Fix: il controllo era "argc < 4" ma piu' sotto si legge argv[4] (fps_n). Con argc==4
+    // argv[4] e' argv[argc], che lo standard C garantisce essere NULL: atoi(NULL) crasha.
+    // Servono almeno 5 elementi (argv[0]=binario + 4 argomenti obbligatori).
+    // (code review: Codex)
+    if (argc < 5) {
         fprintf(stderr,
             "Uso: %s <nome_ndi> <larghezza> <altezza> <fps> [fps_den] [lowest|highest]\n",
             argv[0]);
@@ -109,7 +137,10 @@ int main(int argc, char* argv[])
     const int fps_d  = (argc > 5) ? atoi(argv[5]) : 1;
     const bool lowest_bw = (argc > 6) ? (strcmp(argv[6], "lowest") == 0) : false;
 
-    if (width <= 0 || height <= 0 || fps_n <= 0) {
+    // Fix: fps_d non era validato (code review: Codex). Con fps_d<=0 il calcolo di pts/dts
+    // degenera silenziosamente (es. sempre 0, o negativo), producendo un flusso NDI invalido
+    // senza nessun errore visibile.
+    if (width <= 0 || height <= 0 || fps_n <= 0 || fps_d <= 0) {
         fprintf(stderr, "Parametri non validi.\n");
         return 1;
     }
@@ -123,7 +154,10 @@ int main(int argc, char* argv[])
         return 1;
     }
 
-    NDIlib_send_create_t create_desc;
+    // Zero-init (code review: Codex): protegge da campi non assegnati con valore
+    // indeterminato, incluso il caso di future versioni dell'SDK che aggiungano campi che
+    // questo codice non conosce ancora.
+    NDIlib_send_create_t create_desc{};
     create_desc.p_ndi_name = ndi_name;
     create_desc.p_groups = NULL;
     create_desc.clock_video = true;
@@ -152,12 +186,28 @@ int main(int argc, char* argv[])
     uint64_t frames_sent = 0;
     bool have_params = false;
 
+    // Attiva lo scarico di file di debug in /tmp (vedi sotto) solo se richiesto esplicitamente:
+    // prima veniva sempre scritto al primo keyframe, il che in produzione crea un effetto
+    // collaterale non richiesto, puo' sovrascrivere diagnostica precedente ed espone porzioni
+    // del flusso video ad altri processi locali su una macchina condivisa (code review: Codex).
+    const bool debug_dump = getenv("NDI_HX_DEBUG") != nullptr;
+
     auto emit_frame = [&](bool is_keyframe) {
         if (au.empty()) return;
 
         const size_t hdr_size = sizeof(NDIlib_compressed_packet_t);
         const size_t extra_size = is_keyframe ? annexb_extradata.size() : 0;
         const size_t total = hdr_size + au.size() + extra_size;
+
+        // Guardia overflow (code review: Codex): frame.data_size_in_bytes e' un int con segno,
+        // quindi total non puo' eccedere INT_MAX senza troncare/wrap-around nel cast piu' sotto.
+        // In pratica non capita con un encoder H.264 sano, ma un NAL corrotto o abnorme non deve
+        // poter produrre un pacchetto NDI silenziosamente malformato.
+        if (total > (size_t)INT_MAX) {
+            fprintf(stderr, "[ndi_hx_send] frame scartato: %zu byte eccede INT_MAX.\n", total);
+            au.clear();
+            return;
+        }
 
         std::vector<uint8_t> packet(total);
         NDIlib_compressed_packet_t* hdr = (NDIlib_compressed_packet_t*)packet.data();
@@ -175,7 +225,7 @@ int main(int argc, char* argv[])
         memcpy(packet.data() + hdr_size, au.data(), au.size());
         if (extra_size) memcpy(packet.data() + hdr_size + au.size(), annexb_extradata.data(), extra_size);
 
-        NDIlib_video_frame_v2_t frame;
+        NDIlib_video_frame_v2_t frame{}; // zero-init, vedi nota sopra (code review: Codex)
         frame.xres = width;
         frame.yres = height;
         frame.FourCC = fourcc;
@@ -189,9 +239,10 @@ int main(int argc, char* argv[])
         frame.p_metadata = NULL;
         frame.timestamp = 0;
 
-        if (is_keyframe && frames_sent == 0) {
-            // Debug una tantum: SPS/PPS "nudi" e il pacchetto NDI esatto del primo keyframe,
-            // per poterli ispezionare con ffprobe/hexdump fuori banda.
+        if (debug_dump && is_keyframe && frames_sent == 0) {
+            // Debug una tantum (solo se NDI_HX_DEBUG e' impostata, vedi sopra): SPS/PPS "nudi"
+            // e il pacchetto NDI esatto del primo keyframe, per poterli ispezionare con
+            // ffprobe/hexdump fuori banda.
             FILE* f1 = fopen("/tmp/hx_debug_sps_annexb.h264", "wb");
             if (f1) {
                 static const uint8_t sc[4] = {0, 0, 0, 1};
@@ -218,36 +269,41 @@ int main(int argc, char* argv[])
         au.clear();
     };
 
-    while (!g_stop) {
-        while (reader.next_nal(&nal)) {
-            if (nal.empty()) continue;
-            const int nal_type = nal[0] & 0x1f;
+    // Dispatch per-NAL estratto in una lambda (code review: Codex) cosi' da poterlo riusare
+    // sia nel loop principale sia sull'ultimo NAL recuperato con reader.flush() a EOF.
+    auto process_nal = [&](const std::vector<uint8_t>& n) {
+        if (n.empty()) return;
+        const int nal_type = n[0] & 0x1f;
 
-            if (nal_type == 7 || nal_type == 8) {
-                // SPS (7) / PPS (8): tenute "nude" (senza start code) e riassemblate in Annex-B.
-                if (nal_type == 7) sps_nal = nal;
-                if (nal_type == 8) pps_nal = nal;
-                if (!sps_nal.empty() && !pps_nal.empty()) {
-                    annexb_extradata.clear();
-                    append_annexb(&annexb_extradata, sps_nal);
-                    append_annexb(&annexb_extradata, pps_nal);
-                    have_params = true;
-                }
-                continue;
+        if (nal_type == 7 || nal_type == 8) {
+            // SPS (7) / PPS (8): tenute "nude" (senza start code) e riassemblate in Annex-B.
+            if (nal_type == 7) sps_nal = n;
+            if (nal_type == 8) pps_nal = n;
+            if (!sps_nal.empty() && !pps_nal.empty()) {
+                annexb_extradata.clear();
+                append_annexb(&annexb_extradata, sps_nal);
+                append_annexb(&annexb_extradata, pps_nal);
+                have_params = true;
             }
-            if (nal_type == 9 || nal_type == 6) {
-                continue; // AUD / SEI: non servono nel payload NDI
-            }
-            if (nal_type == 1 || nal_type == 5) {
-                // Slice (non-IDR / IDR): un frame per slice, dato che l'encoder non fa slicing.
-                append_annexb(&au, nal);
-                emit_frame(/*is_keyframe=*/nal_type == 5 && have_params);
-                continue;
-            }
-            // Altri tipi (filler, ecc.): ignorati.
+            return;
         }
+        if (nal_type == 9 || nal_type == 6) {
+            return; // AUD / SEI: non servono nel payload NDI
+        }
+        if (nal_type == 1 || nal_type == 5) {
+            // Slice (non-IDR / IDR): un frame per slice, dato che l'encoder non fa slicing.
+            append_annexb(&au, n);
+            emit_frame(/*is_keyframe=*/nal_type == 5 && have_params);
+            return;
+        }
+        // Altri tipi (filler, ecc.): ignorati.
+    };
+
+    while (!g_stop) {
+        while (reader.next_nal(&nal)) process_nal(nal);
         if (!reader.fill()) break; // EOF su stdin (ffmpeg terminato)
     }
+    if (reader.flush(&nal)) process_nal(nal); // ultimo NAL residuo, vedi NalReader::flush()
 
     fprintf(stderr, "Stream terminato. Inviati %llu frame.\n", (unsigned long long)frames_sent);
 
