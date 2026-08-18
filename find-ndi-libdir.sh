@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Da "sourceare" (non eseguire) dagli script di build dopo aver impostato NDI_SDK. Popola la
 # variabile LIBDIR con la sottocartella lib/<arch> giusta per l'host corrente, invece di
 # prendere semplicemente "la prima trovata" (code review: Codex, fase 3 - "rilevare
